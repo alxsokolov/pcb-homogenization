@@ -1,0 +1,17 @@
+# Isotropic elastic properties for PCB homogenization.
+# Values here are simplified starting points; replace with measured data as needed.
+
+copper:
+  E_GPa: 120.0    # Young's modulus (bulk copper ~120–130 GPa)
+  nu: 0.34        # Poisson's ratio
+  rho_kg_m3: 8960
+  CTE_per_K: 17.0e-6
+
+FR4:
+  # Elastic properties: isotropic approximation using in-plane values
+  E_GPa: 20.0
+  nu: 0.20
+  rho_kg_m3: 1850
+  # CTE: FR4 is strongly anisotropic in thermal expansion
+  CTE_inplane_per_K: 14.0e-6      # x, y directions (~14–18 ppm/K)
+  CTE_outofplane_per_K: 60.0e-6   # z direction (through-thickness, ~50–70 ppm/K)
