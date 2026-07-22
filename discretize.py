@@ -39,10 +39,11 @@ from matplotlib.path import Path as MplPath
 # RS-274X Gerber parser
 # ---------------------------------------------------------------------------
 
-_FORMAT_RE = re.compile(r'%FSLAX(\d)(\d)Y(\d)(\d)%')
-_UNIT_RE   = re.compile(r'%MO(MM|IN)%')
-_ADD_RE    = re.compile(r'%ADD(\d+)([CRO]),([^%]+)%')
-_COORD_RE  = re.compile(r'(?:X(-?\d+))?(?:Y(-?\d+))?D(\d+)$')
+_FORMAT_RE  = re.compile(r'%FSLAX(\d)(\d)Y(\d)(\d)%')
+_UNIT_RE    = re.compile(r'%MO(MM|IN)%')
+_ADD_RE     = re.compile(r'%ADD(\d+)(RoundRect|[CRO]),([^%]+)%')
+_ADD_ANY_RE = re.compile(r'%ADD(\d+)([A-Za-z][A-Za-z0-9]*),')  # for logging unsupported macro apertures
+_COORD_RE   = re.compile(r'(?:X(-?\d+))?(?:Y(-?\d+))?D(\d+)$')
 
 
 def _tokenize(text: str) -> list[str]:
@@ -75,8 +76,14 @@ def _tokenize(text: str) -> list[str]:
 
 @dataclass
 class _Aperture:
-    kind: str              # 'C' circle | 'R' rectangle | 'O' oblong
+    kind: str              # 'C' circle | 'R' rectangle | 'O' oblong | 'RoundRect' macro
     params: list[float]    # C:[diam], R/O:[width, height]
+                           # RoundRect:[radius, x1,y1,x2,y2,x3,y3,x4,y4, rotation_deg]
+                           # (KiCad's standard RoundRect aperture macro: a rectangle with
+                           # rounded corners, given as its 4 corner offsets + a rotation;
+                           # the corner radius is not applied here — the shape is
+                           # rasterized as the sharp-cornered quadrilateral, a negligible
+                           # approximation for homogenization purposes)
 
     @property
     def width(self) -> float:
@@ -93,6 +100,7 @@ class GerberGeometry:
     regions: list[np.ndarray] = field(default_factory=list)  # closed polygons (N,2)
     flashes: list[dict]       = field(default_factory=list)  # {x, y, aperture}
     strokes: list[dict]       = field(default_factory=list)  # {p0, p1, aperture}
+    dropped: dict[str, int]   = field(default_factory=dict)  # {macro_name: count} skipped shapes
 
 
 def parse_gerber(path: Path) -> GerberGeometry:
@@ -101,6 +109,7 @@ def parse_gerber(path: Path) -> GerberGeometry:
     dec_digits = 6       # default for X46Y46 → scale = 1e6
     units_mm   = True
     apertures: dict[int, _Aperture] = {}
+    unsupported: dict[int, str] = {}  # aperture id -> macro name, when _ADD_RE didn't match
     geo        = GerberGeometry()
 
     in_region    = False
@@ -129,6 +138,10 @@ def parse_gerber(path: Path) -> GerberGeometry:
             if m:
                 params = [float(p) for p in m.group(3).split('X') if p]
                 apertures[int(m.group(1))] = _Aperture(kind=m.group(2), params=params)
+            else:
+                m_any = _ADD_ANY_RE.match(tok)
+                if m_any:
+                    unsupported[int(m_any.group(1))] = m_any.group(2)
             continue  # skip TF/TA/TO/LP etc.
 
         # ── Strip leading G-code prefix (handles e.g. "G01X100Y200D01") ──
@@ -183,12 +196,16 @@ def parse_gerber(path: Path) -> GerberGeometry:
                 ap = apertures.get(cur_ap_id)  # type: ignore[arg-type]
                 if ap:
                     geo.strokes.append({'p0': (cur_x, cur_y), 'p1': (x, y), 'aperture': ap})
+                elif cur_ap_id in unsupported:
+                    geo.dropped[unsupported[cur_ap_id]] = geo.dropped.get(unsupported[cur_ap_id], 0) + 1
             cur_x, cur_y = x, y
 
         elif d_code == 3:                          # flash
             ap = apertures.get(cur_ap_id)  # type: ignore[arg-type]
             if ap:
                 geo.flashes.append({'x': x, 'y': y, 'aperture': ap})
+            elif cur_ap_id in unsupported:
+                geo.dropped[unsupported[cur_ap_id]] = geo.dropped.get(unsupported[cur_ap_id], 0) + 1
             cur_x, cur_y = x, y
 
     return geo
@@ -207,6 +224,23 @@ def _rect_poly(cx: float, cy: float, w: float, h: float) -> np.ndarray:
     hw, hh = w / 2, h / 2
     return np.array([[cx - hw, cy - hh], [cx + hw, cy - hh],
                      [cx + hw, cy + hh], [cx - hw, cy + hh]], dtype=float)
+
+
+def _roundrect_poly(cx: float, cy: float, params: list[float]) -> np.ndarray:
+    """
+    KiCad's RoundRect aperture macro: [radius, x1,y1,x2,y2,x3,y3,x4,y4, rotation_deg].
+    The 4 (xi,yi) are corner offsets already in board orientation; rotation_deg
+    (observed as 0 in practice) is applied on top for robustness. Corner
+    rounding is ignored — rasterized as the sharp-cornered quadrilateral.
+    """
+    _radius, *corners_and_rot = params
+    rot_deg = corners_and_rot[8] if len(corners_and_rot) > 8 else 0.0
+    pts = np.array(corners_and_rot[:8], dtype=float).reshape(4, 2)
+    if rot_deg:
+        th = np.radians(rot_deg)
+        c, s = np.cos(th), np.sin(th)
+        pts = pts @ np.array([[c, -s], [s, c]]).T
+    return pts + np.array([cx, cy])
 
 
 def _capsule_poly(p0: tuple, p1: tuple, width: float, n_cap: int = 10) -> np.ndarray:
@@ -247,6 +281,8 @@ def geometry_to_polygons(geo: GerberGeometry) -> list[np.ndarray]:
         x, y, ap = fl['x'], fl['y'], fl['aperture']
         if ap.kind == 'C':
             polys.append(_circle_poly(x, y, ap.width / 2))
+        elif ap.kind == 'RoundRect':
+            polys.append(_roundrect_poly(x, y, ap.params))
         else:
             polys.append(_rect_poly(x, y, ap.width, ap.height))
 
@@ -349,6 +385,10 @@ def discretize_sample(
             continue
         print(f'  Parsing   {gbr_path.name} …')
         geo   = parse_gerber(gbr_path)
+        if geo.dropped:
+            dropped_str = ', '.join(f'{n}x {name}' for name, n in geo.dropped.items())
+            print(f'  [warn] {gbr_path.name}: skipped unsupported aperture macros: {dropped_str}',
+                  file=sys.stderr)
         polys = geometry_to_polygons(geo)
         print(f'  Rasterizing {len(polys)} polygon(s) → {nx}×{ny} grid …')
         layer_mask = rasterize(polys, W, H, nx, ny)

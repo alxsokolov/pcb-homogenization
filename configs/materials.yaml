@@ -15,3 +15,9 @@ FR4:
   # CTE: FR4 is strongly anisotropic in thermal expansion
   CTE_inplane_per_K: 14.0e-6      # x, y directions (~14–18 ppm/K)
   CTE_outofplane_per_K: 60.0e-6   # z direction (through-thickness, ~50–70 ppm/K)
+
+component_ceramic_chip:
+  # Illustrative alumina/ceramic chip-resistor body CTE, NOT validated for
+  # any specific package — used by solder_reliability.py's CTE-mismatch
+  # shear-strain estimate.
+  CTE_per_K: 6.5e-6
