@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.1 (2026-10-01)
+
+- Added `configs/thermal_profile_example.yaml`, a shortened 2-cycle profile for quick demonstration runs.
+- The README quickstart now uses the example profile and a local MAPDL run directory.
+
 ## v0.1.0 (2026-10-01)
 
 First internal release for MikroVAL partners.

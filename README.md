@@ -58,12 +58,17 @@ python discretize.py data/samples/rv3032_real
 python quadtree.py data/samples/rv3032_real --max-level 6
 python plot_quadtree.py data/samples/rv3032_real
 
-python simulate_pyansys_assembly.py data/samples/rv3032_real --nx 20 --ny 20 --creep
+python simulate_pyansys_assembly.py data/samples/rv3032_real --nx 20 --ny 20 --creep `
+    --thermal-profile configs/thermal_profile_example.yaml --mapdl-dir C:\temp\mapdl_example
 
 python temperature_history.py      data/samples/rv3032_real
 python zone_creep_strain.py        data/samples/rv3032_real --target-ratio 0.25
 python plot_cycle_creep_increment.py data/samples/rv3032_real
 ```
+
+`configs/thermal_profile_example.yaml` is a shortened profile for demonstration runs. It has 2 cycles with 300 s holds at each temperature extreme. For a production fatigue evaluation, use the full `configs/thermal_profile.yaml` instead. It is the default when `--thermal-profile` is omitted.
+
+Put `--mapdl-dir` on a local disk. MAPDL writes multi-GB scratch and result files there, and a network share slows the solve down considerably.
 
 Pass `--help` to any script to see all of its options.
 

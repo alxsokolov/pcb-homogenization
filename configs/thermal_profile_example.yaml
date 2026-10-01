@@ -1,0 +1,24 @@
+# Shortened example profile for quick demonstration runs -- NOT for fatigue evaluation.
+#
+# Same reflow cool-down and the same -40C/125C ramp rates as
+# thermal_profile.yaml, but:
+#   - no 1800 s room-temperature dwell after reflow,
+#   - 2 thermal cycles instead of 3+,
+#   - 300 s dwells at -40C / 125C instead of 900 s (less creep relaxation per
+#     cycle, so per-cycle creep increments come out smaller than the full run).
+# Two cycles are the minimum for plot_cycle_creep_increment.py to show a
+# cycle-to-cycle comparison.
+reference_temp_c: 180
+profile:
+  - [0,     205]   # reflow peak -- stress-free reference temperature
+  - [1800,  22]    # cool to room temp
+  - [2172,  -40]
+  - [2472,  -40]
+  - [3462,  125]
+  - [3762,  125]
+  - [4752,  -40]
+  - [5052,  -40]
+  - [6042,  125]
+  - [6342,  125]
+  - [7332,  -40]
+  - [7632,  -40]
