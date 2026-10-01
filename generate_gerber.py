@@ -14,7 +14,7 @@ Directory layout produced for each sample:
             B_Cu.gbr          RS-274X, bottom copper layer
             Edge_Cuts.gbr     RS-274X, board outline
         mesh/                 populated by discretize.py
-        results/              populated by simulate_tensile.py
+        results/              populated by the simulation scripts
         metadata.json         board & stackup parameters
 
 Usage:

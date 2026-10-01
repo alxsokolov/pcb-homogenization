@@ -1,3 +1,10 @@
-# Core pipeline — add to your fenicsx conda env as needed
-pyyaml>=6.0        # optional: only needed for --config flag in generate_gerber.py
-numpy>=1.24        # needed by discretize.py (next step)
+# Tested with Python 3.14 (conda env "pyansys") and ANSYS MAPDL 2025 R2 (v251).
+# MAPDL itself (plus a license) is required for simulate_pyansys_*.py;
+# the geometry/homogenization scripts only need numpy, matplotlib, pillow, pyyaml.
+numpy==2.5.0
+matplotlib==3.11.0
+pillow==12.2.0
+PyYAML==6.0.3
+ansys-mapdl-core==0.73.1
+ansys-mapdl-reader==0.56.0
+pyvista==0.48.4

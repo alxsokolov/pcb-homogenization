@@ -15,17 +15,12 @@ Reads the per-layer material maps produced by discretize.py.
 Output written to <sample_dir>/mesh/quadtree.json:
     max_level, criterion, board dims, and one record per leaf:
     bbox_mm, level, phi_top, phi_bot, plus the homogenized properties from
-    either homogenization.voigt_reuss_bounds() (default) or, with
-    --homogenizer ml, the trained CNN surrogate in ml_homogenization.py
-    (rasterized leaf layout -> effective anisotropic properties, more
-    accurate than Voigt-Reuss since it sees the actual copper pattern, not
-    just its area fraction).
+    homogenization.voigt_reuss_bounds().
 
 Usage:
     python quadtree.py data/samples/dummy_test
     python quadtree.py data/samples/dummy_test --max-level 8
     python quadtree.py data/samples/dummy_test --max-leaves 16
-    python quadtree.py data/samples/dummy_test --homogenizer ml --ml-model models/leaf_cnn_v1
 """
 
 from __future__ import annotations
@@ -264,40 +259,6 @@ def homogenize_leaves(root: QuadNode, materials: dict,
         )
 
 
-def homogenize_leaves_ml(root: QuadNode, model, config: dict, materials: dict,
-                         t_cu_mm: float, t_fr4_mm: float,
-                         top_map: np.ndarray, bot_map: np.ndarray,
-                         Lx: float, Ly: float) -> None:
-    """Populate leaf.props via the trained CNN surrogate (ml_homogenization.py)
-    instead of the analytical Voigt-Reuss bounds, cropping each leaf's own
-    footprint out of the full-board rasters. Falls back to Voigt-Reuss per
-    leaf (never hard-crashes the pipeline) if a leaf's raster crop is
-    degenerate, e.g. narrower than one pixel at very deep levels."""
-    import ml_homogenization as mlh
-
-    E_cu = materials["copper"]["E_GPa"] * 1e9
-    E_fr4 = materials["FR4"]["E_GPa"] * 1e9
-    alpha_cu = materials["copper"].get("CTE_per_K", 17e-6)
-    alpha_fr4_ip = materials["FR4"].get("CTE_inplane_per_K", materials["FR4"].get("CTE_per_K", 14e-6))
-    alpha_fr4_op = materials["FR4"].get("CTE_outofplane_per_K", materials["FR4"].get("CTE_per_K", 60e-6))
-
-    def _vr_fallback(phi_top, phi_bot):
-        return voigt_reuss_bounds(phi_top, phi_bot, E_cu=E_cu, E_fr4=E_fr4,
-                                  t_cu=t_cu_mm, t_fr4=t_fr4_mm, alpha_cu=alpha_cu,
-                                  alpha_fr4_ip=alpha_fr4_ip, alpha_fr4_op=alpha_fr4_op)
-
-    for leaf in collect_leaves(root):
-        iy0, iy1, ix0, ix1 = _bbox_to_pixel_slice(top_map, Lx, Ly, leaf.x0, leaf.y0, leaf.x1, leaf.y1)
-        top_crop, bot_crop = top_map[iy0:iy1, ix0:ix1], bot_map[iy0:iy1, ix0:ix1]
-        if top_crop.size == 0 or bot_crop.size == 0:
-            print(f"[warn] leaf bbox=({leaf.x0:.3f},{leaf.y0:.3f},{leaf.x1:.3f},{leaf.y1:.3f}) "
-                 "has an empty raster crop -- falling back to Voigt-Reuss.", file=sys.stderr)
-            leaf.props = _vr_fallback(leaf.phi_top, leaf.phi_bot)
-            continue
-        leaf.props = mlh.predict_leaf_properties(top_crop, bot_crop, leaf.phi_top, leaf.phi_bot,
-                                                  materials, t_cu_mm, t_fr4_mm, model, config)
-
-
 def to_records(root: QuadNode) -> list[dict]:
     records = []
     for leaf in collect_leaves(root):
@@ -352,12 +313,6 @@ def main() -> None:
                              "instead of depth-first 'split every mixed leaf'. Skips 2:1 "
                              "balancing (which would fight a hard leaf-count cap).")
     parser.add_argument("--materials", type=Path, default=Path("configs/materials.yaml"))
-    parser.add_argument("--homogenizer", choices=["voigt_reuss", "ml"], default="voigt_reuss",
-                        help="Per-leaf homogenization method: analytical Voigt-Reuss bounds, "
-                             "or the trained CNN surrogate (ml_homogenization.py).")
-    parser.add_argument("--ml-model", type=Path, default=Path("models/leaf_cnn_v1"),
-                        help="Model directory for --homogenizer ml (checkpoint.pt + config.json). "
-                             "Only loaded (and only requires torch) when --homogenizer ml is used.")
     args = parser.parse_args()
 
     if not args.sample_dir.exists():
@@ -390,14 +345,7 @@ def main() -> None:
         balance_2to1(root, layer_maps["top"], layer_maps["bottom"], Lx, Ly, args.max_level)
         criterion = "boundary_straddle_then_2to1_balance"
 
-    if args.homogenizer == "ml":
-        import ml_homogenization as mlh
-        print(f"Homogenizing leaves via CNN surrogate ({args.ml_model}) …")
-        model, config = mlh.load_model(args.ml_model)
-        homogenize_leaves_ml(root, model, config, mat, t_cu, t_fr4,
-                             layer_maps["top"], layer_maps["bottom"], Lx, Ly)
-    else:
-        homogenize_leaves(root, mat, t_cu, t_fr4)
+    homogenize_leaves(root, mat, t_cu, t_fr4)
 
     leaves = collect_leaves(root)
     levels = [leaf.level for leaf in leaves]
