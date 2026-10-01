@@ -1,0 +1,37 @@
+# Reflow-to-thermal-cycling temperature profile: time [s], temperature [C].
+#
+# The FIRST point (205C) is the true reflow peak -- physically the
+# stress-free state, since solder solidifies there with no residual
+# thermal stress yet. reference_temp_c is set to 180C instead, NOT 205C,
+# because the solder's own characterized CTE/elastic-modulus data (from
+# the CR0805 archive / SAC305_MikroVal.mac) only extends to 180C --
+# confirmed empirically: TREF(205) raised "Tref is outside of the
+# temperature range defined by the MPTEMP data used for CTEX of material
+# 9" during solve. Using 180C keeps TREF within validated material data,
+# at the cost of a small (~25C) residual thermal strain already present
+# at t=0 rather than a perfectly stress-free start -- a deliberate
+# approximation, not an oversight; revisit if the solder's CTE
+# characterization is ever extended to cover the true reflow temperature.
+#
+# Everything after the first point is one ramped load step per
+# consecutive pair: cool from reflow to room temp, dwell, then repeated
+# -40C/125C thermal cycling.
+reference_temp_c: 180
+profile:
+  - [0,     205]   # reflow peak -- stress-free reference temperature
+  - [1800,  22]    # cool to room temp
+  - [3600,  22]    # dwell at room temp
+  - [3972,  -40]
+  - [4872,  -40]
+  - [5862,  125]
+  - [6762,  125]
+  - [7752,  -40]
+  - [8652,  -40]
+  - [9642,  125]
+  - [10542, 125]
+  - [11532, -40]
+  - [12432, -40]
+  - [13422, 125]
+  - [14322, 125]
+  - [15312, -40]
+  - [16212, -40]
