@@ -2,3 +2,7 @@ data/
 __pycache__/
 *.pyc
 .DS_Store
+mapdl_run/
+~$*
+.claude/settings.local.json
+scratch_*.py

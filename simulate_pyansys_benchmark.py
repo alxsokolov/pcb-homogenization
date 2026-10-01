@@ -45,6 +45,9 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 from homogenization import load_materials
 from quadtree import _load_layer_maps
@@ -206,6 +209,8 @@ def apply_321_fixture(mapdl, node_ids: dict) -> None:
 
 
 def solve_thermal_step(mapdl, ref_temp_c: float, delta_t: float) -> None:
+    mapdl.finish()
+    mapdl.slashsolu()
     mapdl.allsel()
     mapdl.tref(ref_temp_c)
     mapdl.bfunif("TEMP", ref_temp_c + delta_t)
@@ -250,6 +255,44 @@ def evaluate_from_mapdl(mapdl, node_ids: dict,
     except Exception as e:
         print(f"[warn] von Mises query failed, skipping (main QoI unaffected): {e}", file=sys.stderr)
     return result
+
+
+def get_nodal_eqv_field(mapdl) -> tuple[np.ndarray, np.ndarray]:
+    """Coordinates [mm] and von Mises (equivalent) stress [MPa] for every
+    currently-selected node, from the active POST1 result set (must be
+    called while still in the same session that called evaluate_from_mapdl,
+    since that's what leaves POST1 pointed at the solved load step)."""
+    mapdl.allsel()
+    coords = np.asarray(mapdl.mesh.nodes)
+    eqv = np.asarray(mapdl.post_processing.nodal_eqv_stress())
+    return coords, eqv
+
+
+def plot_von_mises_top_view(coords_mm: np.ndarray, eqv_mpa: np.ndarray,
+                            Lx_mm: float, Ly_mm: float, Lz_mm: float, out_path: Path) -> None:
+    """Top-surface (z = Lz_mm, the component side PAD_1/PAD_2 sit on) nodal
+    von Mises stress at the end of the temperature ramp."""
+    top_mask = np.isclose(coords_mm[:, 2], Lz_mm)
+    x, y, s = coords_mm[top_mask, 0], coords_mm[top_mask, 1], eqv_mpa[top_mask]
+
+    fig, ax = plt.subplots(figsize=(7, 5.5))
+    tpc = ax.tricontourf(x, y, s, levels=20, cmap="inferno")
+    xs = [PAD_1_XY_MM[0], PAD_2_XY_MM[0]]
+    ys = [PAD_1_XY_MM[1], PAD_2_XY_MM[1]]
+    ax.scatter(xs, ys, marker="+", c="cyan", s=120, linewidths=1.8, zorder=5)
+    for (px, py), name in zip([PAD_1_XY_MM, PAD_2_XY_MM], ["pad1", "pad2"]):
+        ax.annotate(name, (px, py), xytext=(6, 6), textcoords="offset points",
+                   color="cyan", fontsize=9, zorder=5)
+    ax.set_xlim(0, Lx_mm)
+    ax.set_ylim(0, Ly_mm)
+    ax.set_aspect("equal")
+    ax.set_xlabel("x [mm]")
+    ax.set_ylabel("y [mm]")
+    ax.set_title(f"Top-surface von Mises stress @ end of ramp ({COMPONENT_NAME})")
+    fig.colorbar(tpc, ax=ax, label="von Mises [MPa]")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
 
 
 # ---------------------------------------------------------------------------
@@ -312,6 +355,7 @@ def main() -> None:
         solve_thermal_step(mapdl, args.ref_temp_c, args.delta_t)
         result = evaluate_from_mapdl(mapdl, node_ids, alpha_component, args.delta_t,
                                      args.standoff_mm, args.cm_c, args.cm_m)
+        coords_mm, eqv_mpa = get_nodal_eqv_field(mapdl)
     finally:
         mapdl.exit()
 
@@ -327,6 +371,10 @@ def main() -> None:
     out_path = results_dir / "pyansys_benchmark.json"
     out_path.write_text(json.dumps(result, indent=2) + "\n")
     print(f"\nWrote {out_path}")
+
+    plot_path = results_dir / "von_mises_top.png"
+    plot_von_mises_top_view(coords_mm, eqv_mpa, Lx_mm, Ly_mm, Lz_mm, plot_path)
+    print(f"Wrote {plot_path}")
 
 
 if __name__ == "__main__":
