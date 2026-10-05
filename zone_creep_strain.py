@@ -48,7 +48,7 @@ already used in plot_creep_strain_history.py.
 Elements sharing the solder MAT id but not actually solid (CONTA174/TARGE170
 contact elements tagged with the underlying part's material) are excluded by
 requiring a genuine 3-D solid VTK cell type -- confirmed against
-data/samples/rv3032_real: MAT=9 covers 650 cells, only 520 of which are real
+data/samples/rv3032_example: MAT=9 covers 650 cells, only 520 of which are real
 SOLID186 hexahedra; the other 130 are contact quads with zero volume that
 would otherwise dilute the volume-weighted ranking with junk entries.
 
@@ -66,8 +66,8 @@ is caught and warned about rather than losing the JSON/history-plot outputs
 that already succeeded.
 
 Usage:
-    python zone_creep_strain.py data/samples/rv3032_real
-    python zone_creep_strain.py data/samples/rv3032_real \\
+    python zone_creep_strain.py data/samples/rv3032_example
+    python zone_creep_strain.py data/samples/rv3032_example \\
         --target-ratio 0.25 --time-start 0 --time-end 3600
 """
 

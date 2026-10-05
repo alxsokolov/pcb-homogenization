@@ -5,4 +5,13 @@ __pycache__/
 mapdl_run/
 ~$*
 .claude/settings.local.json
+.continue/
 scratch_*.py
+
+# LaTeX build files
+docs/overview/*.aux
+docs/overview/*.log
+docs/overview/*.out
+docs/overview/*.fls
+docs/overview/*.fdb_latexmk
+docs/overview/*.synctex.gz

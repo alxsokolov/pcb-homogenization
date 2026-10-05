@@ -1,27 +1,24 @@
 #!/usr/bin/env python3
 """
-Discretize PCB copper layers (Gerber or ODB++) into a 2D binary material map.
+Discretize Gerber copper layers into a 2D binary material map.
 
-Reads a sample directory (produced by generate_gerber.py, import_real_board.py,
-or import_odb_board.py), parses every copper layer — RS-274X Gerber or ODB++
-feature files, per each layer's "format" in metadata.json — rasterizes it onto
-a uniform pixel grid, and merges all layers into a single material indicator
-array. The two formats share the LayerGeometry model and rasterizer in
-raster_geometry.py, so downstream output is identical either way.
+Reads a sample directory (produced by import_real_board.py), parses every copper layer's RS-274X Gerber file,
+rasterizes it onto a uniform pixel grid, and merges all layers into a single
+material indicator array.
 
 Cell values:
     1.0  →  copper
     0.0  →  FR4 dielectric
 
 Output written to <sample_dir>/mesh/:
-    material_map.npy         float32 array of shape (ny, nx)
-    material_map.png         grayscale image: white=copper, black=FR4  (Y flipped)
-    discretization.json      grid metadata for downstream FEniCSx scripts
+    material_map.npy         float32 array of shape (ny, nx), combined OR of all Cu layers
+    <layer>_map.npy          per-copper-layer boolean map (e.g. F_Cu_map.npy)
+    discretization.json      grid metadata for quadtree.py / simulate_pyansys_*.py
 
 Usage:
-    python discretize.py data/samples/dummy_test
-    python discretize.py data/samples/dummy_test --resolution 10
-    python discretize.py data/samples/dummy_test --resolution 20 --no-png
+    python discretize.py data/samples/rv3032_example
+    python discretize.py data/samples/rv3032_example --resolution 40
+    python discretize.py data/samples/rv3032_example --resolution 20
 """
 
 from __future__ import annotations
@@ -30,13 +27,12 @@ import argparse
 import json
 import re
 import sys
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
-
-import odb_parser
-from raster_geometry import Aperture, LayerGeometry, rasterize_layer
+from matplotlib.path import Path as MplPath
 
 
 # ---------------------------------------------------------------------------
@@ -78,14 +74,43 @@ def _tokenize(text: str) -> list[str]:
     return tokens
 
 
-def parse_gerber(path: Path) -> LayerGeometry:
+@dataclass
+class _Aperture:
+    kind: str              # 'C' circle | 'R' rectangle | 'O' oblong | 'RoundRect' macro
+    params: list[float]    # C:[diam], R/O:[width, height]
+                           # RoundRect:[radius, x1,y1,x2,y2,x3,y3,x4,y4, rotation_deg]
+                           # (KiCad's standard RoundRect aperture macro: a rectangle with
+                           # rounded corners, given as its 4 corner offsets + a rotation;
+                           # the corner radius is not applied here — the shape is
+                           # rasterized as the sharp-cornered quadrilateral, a negligible
+                           # approximation for homogenization purposes)
+
+    @property
+    def width(self) -> float:
+        return self.params[0]
+
+    @property
+    def height(self) -> float:
+        return self.params[1] if len(self.params) > 1 else self.params[0]
+
+
+@dataclass
+class GerberGeometry:
+    """Raw geometry from one RS-274X layer (all coordinates in mm)."""
+    regions: list[np.ndarray] = field(default_factory=list)  # closed polygons (N,2)
+    flashes: list[dict]       = field(default_factory=list)  # {x, y, aperture}
+    strokes: list[dict]       = field(default_factory=list)  # {p0, p1, aperture}
+    dropped: dict[str, int]   = field(default_factory=dict)  # {macro_name: count} skipped shapes
+
+
+def parse_gerber(path: Path) -> GerberGeometry:
     """Parse a RS-274X Gerber file and return geometry with coordinates in mm."""
     tokens     = _tokenize(path.read_text())
     dec_digits = 6       # default for X46Y46 → scale = 1e6
     units_mm   = True
-    apertures: dict[int, Aperture] = {}
+    apertures: dict[int, _Aperture] = {}
     unsupported: dict[int, str] = {}  # aperture id -> macro name, when _ADD_RE didn't match
-    geo        = LayerGeometry()
+    geo        = GerberGeometry()
 
     in_region    = False
     region_pts: list[tuple[float, float]] = []
@@ -112,7 +137,7 @@ def parse_gerber(path: Path) -> LayerGeometry:
             m = _ADD_RE.match(tok)
             if m:
                 params = [float(p) for p in m.group(3).split('X') if p]
-                apertures[int(m.group(1))] = Aperture(kind=m.group(2), params=params)
+                apertures[int(m.group(1))] = _Aperture(kind=m.group(2), params=params)
             else:
                 m_any = _ADD_ANY_RE.match(tok)
                 if m_any:
@@ -187,25 +212,121 @@ def parse_gerber(path: Path) -> LayerGeometry:
 
 
 # ---------------------------------------------------------------------------
-# Output helpers
+# Geometry → polygon list
 # ---------------------------------------------------------------------------
 
-def _save_png(material: np.ndarray, path: Path) -> None:
-    """Grayscale PNG: white=copper, black=FR4. Flipped so Y=0 is bottom."""
-    try:
-        from PIL import Image
-        img = Image.fromarray((material[::-1] * 255).astype(np.uint8), mode='L')
-        img.save(path)
-    except ImportError:
-        import matplotlib
-        matplotlib.use('Agg')
-        import matplotlib.pyplot as plt
-        fig, ax = plt.subplots(figsize=(6, 6), dpi=150)
-        ax.imshow(material[::-1], cmap='gray', vmin=0, vmax=1, origin='upper')
-        ax.axis('off')
-        fig.savefig(path, bbox_inches='tight', pad_inches=0)
-        plt.close(fig)
+def _circle_poly(cx: float, cy: float, r: float, n: int = 32) -> np.ndarray:
+    a = np.linspace(0, 2 * np.pi, n, endpoint=False)
+    return np.column_stack([cx + r * np.cos(a), cy + r * np.sin(a)])
 
+
+def _rect_poly(cx: float, cy: float, w: float, h: float) -> np.ndarray:
+    hw, hh = w / 2, h / 2
+    return np.array([[cx - hw, cy - hh], [cx + hw, cy - hh],
+                     [cx + hw, cy + hh], [cx - hw, cy + hh]], dtype=float)
+
+
+def _roundrect_poly(cx: float, cy: float, params: list[float]) -> np.ndarray:
+    """
+    KiCad's RoundRect aperture macro: [radius, x1,y1,x2,y2,x3,y3,x4,y4, rotation_deg].
+    The 4 (xi,yi) are corner offsets already in board orientation; rotation_deg
+    (observed as 0 in practice) is applied on top for robustness. Corner
+    rounding is ignored — rasterized as the sharp-cornered quadrilateral.
+    """
+    _radius, *corners_and_rot = params
+    rot_deg = corners_and_rot[8] if len(corners_and_rot) > 8 else 0.0
+    pts = np.array(corners_and_rot[:8], dtype=float).reshape(4, 2)
+    if rot_deg:
+        th = np.radians(rot_deg)
+        c, s = np.cos(th), np.sin(th)
+        pts = pts @ np.array([[c, -s], [s, c]]).T
+    return pts + np.array([cx, cy])
+
+
+def _capsule_poly(p0: tuple, p1: tuple, width: float, n_cap: int = 10) -> np.ndarray:
+    """Convert a stroke segment + aperture width to a stadium (capsule) polygon."""
+    x0, y0 = p0
+    x1, y1 = p1
+    dx, dy = x1 - x0, y1 - y0
+    L  = np.hypot(dx, dy)
+    r  = width / 2
+    if L < 1e-9:
+        return _circle_poly(x0, y0, r)
+    tx, ty =  dx / L,  dy / L   # unit tangent
+    nx, ny = -ty,  tx           # unit normal (left of tangent)
+
+    pts = []
+    # Right side (p0 → p1) and end-cap at p1
+    pts.append([x0 - nx * r, y0 - ny * r])
+    pts.append([x1 - nx * r, y1 - ny * r])
+    for k in range(1, n_cap):
+        th = np.pi * k / n_cap
+        pts.append([x1 + r * ( tx * np.sin(th) - nx * np.cos(th)),
+                    y1 + r * ( ty * np.sin(th) - ny * np.cos(th))])
+    # Left side (p1 → p0) and end-cap at p0
+    pts.append([x1 + nx * r, y1 + ny * r])
+    pts.append([x0 + nx * r, y0 + ny * r])
+    for k in range(1, n_cap):
+        th = np.pi * k / n_cap
+        pts.append([x0 + r * (-tx * np.sin(th) + nx * np.cos(th)),
+                    y0 + r * (-ty * np.sin(th) + ny * np.cos(th))])
+    return np.array(pts, dtype=float)
+
+
+def geometry_to_polygons(geo: GerberGeometry) -> list[np.ndarray]:
+    """Flatten all geometry types (regions, flashes, strokes) into polygon arrays."""
+    polys: list[np.ndarray] = list(geo.regions)
+
+    for fl in geo.flashes:
+        x, y, ap = fl['x'], fl['y'], fl['aperture']
+        if ap.kind == 'C':
+            polys.append(_circle_poly(x, y, ap.width / 2))
+        elif ap.kind == 'RoundRect':
+            polys.append(_roundrect_poly(x, y, ap.params))
+        else:
+            polys.append(_rect_poly(x, y, ap.width, ap.height))
+
+    for st in geo.strokes:
+        ap = st['aperture']
+        w  = ap.width if ap.kind == 'C' else max(ap.width, ap.height)
+        polys.append(_capsule_poly(st['p0'], st['p1'], w))
+
+    return polys
+
+
+# ---------------------------------------------------------------------------
+# Rasterization
+# ---------------------------------------------------------------------------
+
+def rasterize(
+    polygons: list[np.ndarray],
+    width_mm: float,
+    height_mm: float,
+    nx: int,
+    ny: int,
+) -> np.ndarray:
+    """
+    Rasterize a list of closed polygons onto an (ny × nx) grid.
+    Samples at cell centres of a uniform pixel lattice.
+    Returns float32 array with values in {0.0, 1.0}.
+    """
+    xs = np.linspace(width_mm  / nx / 2, width_mm  - width_mm  / nx / 2, nx)
+    ys = np.linspace(height_mm / ny / 2, height_mm - height_mm / ny / 2, ny)
+    xx, yy  = np.meshgrid(xs, ys)
+    pts_flat = np.column_stack([xx.ravel(), yy.ravel()])
+
+    mask = np.zeros(ny * nx, dtype=bool)
+    for poly in polygons:
+        if len(poly) < 3:
+            continue
+        mask |= MplPath(poly).contains_points(pts_flat)
+
+    return mask.reshape(ny, nx).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
 
 def _save_json(path: Path, **kwargs) -> None:
     path.write_text(json.dumps(kwargs, indent=2) + '\n')
@@ -218,7 +339,6 @@ def _save_json(path: Path, **kwargs) -> None:
 def discretize_sample(
     sample_dir: Path,
     resolution_px_per_mm: float = 10.0,
-    save_png: bool = True,
 ) -> np.ndarray:
     """Parse + rasterize all copper layers in a sample; write mesh/ outputs."""
     meta_path = sample_dir / 'metadata.json'
@@ -234,7 +354,6 @@ def discretize_sample(
 
     combined = np.zeros((ny, nx), dtype=bool)
     layer_map_info = {}   # {layer_name: {file, position}} — written to discretization.json
-    origin_mm = tuple(meta.get('odb', {}).get('origin_offset_mm', (0.0, 0.0)))
 
     mesh_dir = sample_dir / 'mesh'
     mesh_dir.mkdir(exist_ok=True)
@@ -242,27 +361,23 @@ def discretize_sample(
     for layer in meta['layers']:
         if layer['type'] != 'copper':
             continue
-        layer_path = sample_dir / layer['file']
-        if not layer_path.exists():
-            print(f'  [warn] {layer_path} not found, skipping', file=sys.stderr)
+        gbr_path = sample_dir / layer['file']
+        if not gbr_path.exists():
+            print(f'  [warn] {gbr_path} not found, skipping', file=sys.stderr)
             continue
-        fmt = layer.get('format', 'gerber')
-        print(f'  Parsing   {layer_path.name}  ({fmt}) …')
-        if fmt == 'odb':
-            geo = odb_parser.parse_odb_features(layer_path, origin=origin_mm)
-        else:
-            geo = parse_gerber(layer_path)
+        print(f'  Parsing   {gbr_path.name} …')
+        geo   = parse_gerber(gbr_path)
         if geo.dropped:
             dropped_str = ', '.join(f'{n}x {name}' for name, n in geo.dropped.items())
-            print(f'  [warn] {layer_path.name}: skipped unsupported shapes: {dropped_str}',
+            print(f'  [warn] {gbr_path.name}: skipped unsupported aperture macros: {dropped_str}',
                   file=sys.stderr)
-        n_shapes = len(geo.regions) + len(geo.flashes) + len(geo.strokes) + len(geo.surfaces)
-        print(f'  Rasterizing {n_shapes} shape(s) → {nx}×{ny} grid …')
-        layer_mask = rasterize_layer(geo, W, H, nx, ny)
+        polys = geometry_to_polygons(geo)
+        print(f'  Rasterizing {len(polys)} polygon(s) → {nx}×{ny} grid …')
+        layer_mask = rasterize(polys, W, H, nx, ny)
         combined |= layer_mask.astype(bool)
 
-        # Save individual layer map so simulate_tensile.py can assign each
-        # copper layer its own pattern rather than using the combined OR map.
+        # Save individual layer map so the FE models can assign each copper
+        # layer its own pattern rather than using the combined OR map.
         lname    = layer['name']           # e.g. "F_Cu", "B_Cu"
         lfile    = f'{lname}_map.npy'
         position = layer.get('position', 'unknown')
@@ -275,10 +390,6 @@ def discretize_sample(
     np.save(mesh_dir / 'material_map.npy', material)
     print(f'  Saved  material_map.npy  shape={material.shape}  (combined OR of all Cu layers)')
 
-    if save_png:
-        _save_png(material, mesh_dir / 'material_map.png')
-        print(f'  Saved  material_map.png')
-
     _save_json(
         mesh_dir / 'discretization.json',
         sample_id=meta['sample_id'],
@@ -288,7 +399,6 @@ def discretize_sample(
                   dy_mm=round(H / ny, 8)),
         board=dict(width_mm=W, height_mm=H),
         material_map_file='material_map.npy',
-        material_map_png='material_map.png',
         layer_maps=layer_map_info,
         copper_fraction=round(float(material.mean()), 6),
         timestamp=datetime.now(tz=timezone.utc).isoformat(timespec='seconds'),
@@ -304,19 +414,16 @@ def main() -> None:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument('sample_dir', type=Path,
-                        help='Sample directory produced by generate_gerber.py')
+                        help='Sample directory produced by import_real_board.py')
     parser.add_argument('--resolution', type=float, default=10.0,
                         help='Grid resolution in pixels per mm')
-    parser.add_argument('--no-png', action='store_true', help='Skip PNG output')
     args = parser.parse_args()
 
     if not args.sample_dir.exists():
         sys.exit(f'Not found: {args.sample_dir}')
 
     print(f'Discretizing {args.sample_dir}  @ {args.resolution} px/mm …')
-    discretize_sample(args.sample_dir,
-                      resolution_px_per_mm=args.resolution,
-                      save_png=not args.no_png)
+    discretize_sample(args.sample_dir, resolution_px_per_mm=args.resolution)
 
 
 if __name__ == '__main__':

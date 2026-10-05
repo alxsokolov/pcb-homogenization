@@ -35,8 +35,8 @@ the view is cropped to their combined bounding box plus a margin -- pass
 --no-crop to see the whole board instead.
 
 Usage:
-    python plot_component_materials.py data/samples/rv3032_real
-    python plot_component_materials.py data/samples/rv3032_real --no-crop
+    python plot_component_materials.py data/samples/rv3032_example
+    python plot_component_materials.py data/samples/rv3032_example --no-crop
 """
 
 from __future__ import annotations
@@ -60,10 +60,11 @@ _MAT_NAMES = {
 _MAT_COLORS = {
     9: "#2a78d6",     # solder -- blue, matches this project's other creep-strain plots
     9001: "#eb6834",  # copper -- orange
-    2: "#1baf7a",     # ceramic -- aqua
+    2: "#b8bec6",     # ceramic -- light grey (alumina body)
     6: "#eda100",     # nickel -- yellow
-    9002: "#e87ba4",  # FR4 -- magenta
+    9002: "#5f9e4a",  # FR4 -- PCB green
 }
+_HOMOGENIZED_MAT_BASE = 10001  # simulate_pyansys_benchmark.HOMOGENIZED_MAT_BASE
 _FALLBACK_COLORS = ["#008300", "#4a3aa7", "#e34948"]  # remaining palette slots, in order
 
 # Real 3-D solid VTK cell types -- see zone_creep_strain.py's _SOLID_CELLTYPES
@@ -96,6 +97,8 @@ def crop_bounds(grid, mat: np.ndarray, mask: np.ndarray, board_footprint_ratio: 
 
     component_bounds = []
     for mat_id in np.unique(mat[mask]):
+        if mat_id >= _HOMOGENIZED_MAT_BASE:
+            continue   # per-leaf board materials: small footprints, but board, not component
         idx = np.where(mask & (mat == mat_id))[0]
         sub = grid.extract_cells(idx)
         x0, x1, y0, y1, z0, z1 = sub.bounds
@@ -139,6 +142,11 @@ def plot_component_materials(grid, out_path: Path, crop: bool = True) -> None:
         mat_ids = np.unique(mat[mask])
         get_cells = lambda mat_id: grid.extract_cells(np.where(mask & (mat == mat_id))[0])
 
+    # homogenized board (--board-model homogenized): one MAT per quadtree leaf,
+    # drawn as a single group instead of hundreds of legend entries
+    homog_ids = [int(m) for m in mat_ids if int(m) >= _HOMOGENIZED_MAT_BASE]
+    mat_ids = [int(m) for m in mat_ids if int(m) < _HOMOGENIZED_MAT_BASE]
+
     fallback_idx = [0]
     pl = pv.Plotter(off_screen=True, window_size=(1600, 1200))
     pl.set_background("white")
@@ -150,13 +158,19 @@ def plot_component_materials(grid, out_path: Path, crop: bool = True) -> None:
         color = material_color(int(mat_id), fallback_idx)
         pl.add_mesh(sub, color=color, show_edges=True, edge_color="black", line_width=0.5,
                     label=f"MAT {int(mat_id)}: {material_name(int(mat_id))}")
+    if homog_ids:
+        sub = get_cells(homog_ids[0])
+        for mid in homog_ids[1:]:
+            sub = sub.merge(get_cells(mid))
+        pl.add_mesh(sub, color="#9a8f4e", show_edges=True, edge_color="black", line_width=0.5,
+                    label="Board (homog.)")
 
     unidentified = sorted(int(m) for m in mat_ids if int(m) not in _MAT_NAMES)
     if unidentified:
         print(f"[warn] unidentified material id(s) in mesh: {unidentified} -- "
              "add them to _MAT_NAMES once confirmed, see this script's docstring")
 
-    pl.add_legend(bcolor="white", border=True, face="rectangle", size=(0.26, 0.014 * len(mat_ids)))
+    pl.add_legend(bcolor="white", border=True, face="rectangle", size=(0.26, 0.014 * (len(mat_ids) + bool(homog_ids))))
     pl.add_axes()
     pl.view_isometric()
     pl.reset_camera()

@@ -33,8 +33,8 @@ so "time" here means substep TIME within that one step, not multiple load
 steps -- each stored result set is one substep of the thermal ramp/dwell.
 
 Usage:
-    python plot_creep_strain_history.py data/samples/rv3032_real
-    python plot_creep_strain_history.py data/samples/rv3032_real --rst mapdl_run/file.rst
+    python plot_creep_strain_history.py data/samples/rv3032_example
+    python plot_creep_strain_history.py data/samples/rv3032_example --rst mapdl_run/file.rst
 """
 
 from __future__ import annotations

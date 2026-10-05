@@ -18,9 +18,9 @@ Output written to <sample_dir>/mesh/quadtree.json:
     homogenization.voigt_reuss_bounds().
 
 Usage:
-    python quadtree.py data/samples/dummy_test
-    python quadtree.py data/samples/dummy_test --max-level 8
-    python quadtree.py data/samples/dummy_test --max-leaves 16
+    python quadtree.py data/samples/rv3032_example
+    python quadtree.py data/samples/rv3032_example --max-level 8
+    python quadtree.py data/samples/rv3032_example --max-leaves 16
 """
 
 from __future__ import annotations
@@ -67,7 +67,7 @@ def _bbox_to_pixel_slice(map_arr: np.ndarray, Lx: float, Ly: float,
 
     map_arr follows discretize.py's raw-array convention: row index scales
     directly with y (row 0 -> y near 0), column index scales with x -- the
-    same convention simulate_tensile.py's assign_materials() relies on. Only
+    same convention simulate_pyansys_benchmark._raster_lookup() relies on. Only
     the exported PNG preview flips Y for display; the .npy arrays do not.
     """
     ny_map, nx_map = map_arr.shape
@@ -179,6 +179,40 @@ def build_quadtree_by_budget(top_map: np.ndarray, bot_map: np.ndarray,
         for c in node.children:
             maybe_push(c)
 
+    return root
+
+
+def build_quadtree_focused(top_map: np.ndarray, bot_map: np.ndarray,
+                           Lx: float, Ly: float, max_leaves: int, max_level: int,
+                           focus_bbox: tuple[float, float, float, float]) -> QuadNode:
+    """
+    Leaf-budget quadtree refined toward one region (e.g. a component
+    footprint): repeatedly split the leaf with the largest overlap with
+    focus_bbox (x0, y0, x1, y1) until the budget is used up. Gives graded
+    refinement -- small leaves where the focus region lies, few large leaves
+    elsewhere -- and therefore few homogenized materials. No 2:1 balancing
+    (neighbouring leaves may differ by more than one level).
+    """
+    fx0, fy0, fx1, fy1 = focus_bbox
+    root = _make_leaf(top_map, bot_map, Lx, Ly, 0.0, 0.0, Lx, Ly, level=0)
+    n_leaves = 1
+    counter = itertools.count()
+    heap: list[tuple[float, float, int, QuadNode]] = []
+
+    def maybe_push(node: QuadNode) -> None:
+        ox = min(node.x1, fx1) - max(node.x0, fx0)
+        oy = min(node.y1, fy1) - max(node.y0, fy0)
+        if ox > 0 and oy > 0 and node.level < max_level:
+            area = (node.x1 - node.x0) * (node.y1 - node.y0)
+            heapq.heappush(heap, (-ox * oy, -area, next(counter), node))
+
+    maybe_push(root)
+    while heap and n_leaves + 3 <= max_leaves:
+        node = heapq.heappop(heap)[-1]
+        _split(node, top_map, bot_map, Lx, Ly)
+        n_leaves += 3
+        for c in node.children:
+            maybe_push(c)
     return root
 
 
@@ -312,8 +346,16 @@ def main() -> None:
                         help="Cap total leaf count via greedy impurity-priority splitting "
                              "instead of depth-first 'split every mixed leaf'. Skips 2:1 "
                              "balancing (which would fight a hard leaf-count cap).")
+    parser.add_argument("--focus-component", action="store_true",
+                        help="With --max-leaves: spend the budget refining toward the tracked "
+                             "component (PAD_1/PAD_2 from solder_reliability.py, plus "
+                             "--focus-margin-mm) instead of toward the most mixed leaves.")
+    parser.add_argument("--focus-margin-mm", type=float, default=0.75,
+                        help="Margin around the pad bounding box for --focus-component")
     parser.add_argument("--materials", type=Path, default=Path("configs/materials.yaml"))
     args = parser.parse_args()
+    if args.focus_component and args.max_leaves is None:
+        sys.exit("--focus-component needs --max-leaves")
 
     if not args.sample_dir.exists():
         sys.exit(f"Not found: {args.sample_dir}")
@@ -329,7 +371,19 @@ def main() -> None:
     t_cu = meta["stackup"]["copper_thickness_mm"]
     t_fr4 = meta["stackup"]["dielectric_thickness_mm"]
 
-    if args.max_leaves is not None:
+    if args.focus_component:
+        from solder_reliability import PAD_1_XY_MM, PAD_2_XY_MM
+        m = args.focus_margin_mm
+        focus = (min(PAD_1_XY_MM[0], PAD_2_XY_MM[0]) - m, min(PAD_1_XY_MM[1], PAD_2_XY_MM[1]) - m,
+                 max(PAD_1_XY_MM[0], PAD_2_XY_MM[0]) + m, max(PAD_1_XY_MM[1], PAD_2_XY_MM[1]) + m)
+        print(f"Board {Lx:.1f} x {Ly:.1f} mm — building quadtree refined toward the component "
+              f"(budget: max_leaves={args.max_leaves}, max_level={args.max_level}, focus box "
+              f"x {focus[0]:.2f}-{focus[2]:.2f}, y {focus[1]:.2f}-{focus[3]:.2f} mm) …")
+        root = build_quadtree_focused(layer_maps["top"], layer_maps["bottom"], Lx, Ly,
+                                      args.max_leaves, args.max_level, focus)
+        n_before = len(collect_leaves(root))
+        criterion = "component_focused_budget"
+    elif args.max_leaves is not None:
         print(f"Board {Lx:.1f} x {Ly:.1f} mm — building quadtree "
              f"(budget: max_leaves={args.max_leaves}, max_level={args.max_level}) …")
         root = build_quadtree_by_budget(layer_maps["top"], layer_maps["bottom"], Lx, Ly,

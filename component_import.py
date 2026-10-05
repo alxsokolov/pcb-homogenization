@@ -409,6 +409,14 @@ def import_component(mapdl, cdb_path: Path, offsets: Offsets) -> ComponentHandle
     # protected).
     mapdl.modmsh("NOCHECK")
     mapdl.allsel()
+    # The archive also carries a BFBLOCK fixing every one of its nodes at
+    # 20C (its export temperature). Nodal BF temperatures override BFUNIF,
+    # so left in place the component and solder never follow the thermal
+    # profile -- they sit at 20C for the whole solve while only the board
+    # cycles, and with TREF=180C they start with a 160 K thermal mismatch
+    # (seen as >200 MPa solder stress at a constant 180C hold). Delete them
+    # so the uniform profile temperature applies to the whole assembly.
+    mapdl.bfdele("ALL", "TEMP")
 
     nodes_after = set(mapdl.mesh.nnum_all.tolist())
     elems_after = set(mapdl.mesh.enum_all.tolist())

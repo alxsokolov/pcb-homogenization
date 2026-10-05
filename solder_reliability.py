@@ -25,14 +25,17 @@ downstream mapping.
 Deliberately single-component for now: edit COMPONENT_NAME/PAD_1_XY_MM/
 PAD_2_XY_MM below by hand for whatever joint you're looking at. Coordinates
 are in the sample's local mm frame (same as quadtree.json/material_map.npy).
-The R1 defaults below were found by grepping the exact flash coordinates
-tagged %TO.P,R1,1*%/%TO.P,R1,2*% in data/samples/rv3032_real/gerber/F_Cu.gbr.
+The R1 defaults below are the flash coordinates tagged %TO.P,R1,1*%/
+%TO.P,R1,2*% in data/samples/rv3032_example/gerber/F_Cu.gbr (an 0603
+footprint: 0.55 x 0.40 mm pads, 1.65 mm apart along y).
+simulate_pyansys_assembly.py places the component at their midpoint and
+aligns it with them.
 
 Requires mesh/quadtree.json (from quadtree.py).
 
 Usage:
-    python solder_reliability.py data/samples/rv3032_real
-    python solder_reliability.py data/samples/rv3032_real \\
+    python solder_reliability.py data/samples/rv3032_example
+    python solder_reliability.py data/samples/rv3032_example \\
         --component-cte 6.5e-6 --delta-t 100 --standoff-mm 0.075 \\
         --cm-c 0.5 --cm-m 2.0
 """
@@ -50,8 +53,8 @@ from homogenization import load_materials
 # One component, hand-set. Edit these for whatever joint you're evaluating.
 # ---------------------------------------------------------------------------
 COMPONENT_NAME = "R1"
-PAD_1_XY_MM = (18, 12.2)
-PAD_2_XY_MM = (18, 9.55)
+PAD_1_XY_MM = (15.0, 13.2)
+PAD_2_XY_MM = (15.0, 11.55)
 
 _DEFAULT_COMPONENT_CTE_PER_K = 6.5e-6
 _DEFAULT_DELTA_T_K = 100.0

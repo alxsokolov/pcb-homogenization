@@ -17,7 +17,7 @@ Usage:
     python import_real_board.py \\
         --f-cu path/to/Board-F_Cu.gbr --b-cu path/to/Board-B_Cu.gbr \\
         --bbox 122 -105 142 -90 \\
-        --sample-id rv3032_real
+        --sample-id rv3032_example
 """
 
 from __future__ import annotations

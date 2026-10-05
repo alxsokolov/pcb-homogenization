@@ -1,22 +1,17 @@
 #!/usr/bin/env python3
 """
-PyMAPDL port of simulate_joint_qoi.py's full-resolution benchmark: a
-structured hex mesh painted per-element with copper/FR4 straight from the
-Gerber-derived rasters (mesh/discretization.json + F_Cu_map.npy/
-B_Cu_map.npy, from discretize.py) -- no quadtree homogenization, no CAD
-trace geometry. Drives MAPDL directly via PyMAPDL, bypassing Workbench's
-GUI entirely (no Geometry cell, no Engineering Data import, none of the
-STEP/MatML friction from export_ansys_step.py -- that whole path exists
-only because that other export specifically needed to show up in
-Workbench's GUI tree; this script doesn't).
+Full-resolution board benchmark via PyMAPDL: a structured hex mesh painted
+per-element with copper/FR4 straight from the Gerber-derived rasters
+(mesh/discretization.json + F_Cu_map.npy/B_Cu_map.npy, from discretize.py)
+-- no quadtree homogenization, no CAD trace geometry. Drives MAPDL directly
+via PyMAPDL, without Workbench (no Geometry cell, no Engineering Data import).
 
 Nodes and elements are generated directly (mapdl.n()/mapdl.e(), batched
 via mapdl.non_interactive) rather than through ANSYS's own BLOCK+VMESH
-volume mesher, so the mesh is deterministic and exactly mirrors
-simulate_tensile.py's create_layered_mesh(): same per-physical-layer z
-banding (z_segs), same nx/ny/nz_per_layer resolution knobs, same
-raster-lookup convention as assign_materials()/assign_alpha() (cell
-centroid -> nearest raster pixel, threshold 0.5). This also sidesteps
+volume mesher, so the mesh is deterministic: per-physical-layer z banding
+(bottom Cu / FR4 core / top Cu), nx/ny/nz_per_layer resolution knobs, and
+each element's material taken from the raster pixel at its centroid
+(threshold 0.5). This also sidesteps
 ANSYS's own line-selection/mapped-meshing mechanics entirely, and lets
 each element's MAT be set at creation time (mapdl.mat() pointer) instead
 of a post-mesh EMODIF pass.
@@ -33,8 +28,8 @@ MAPDL install/license -- launch_mapdl() auto-detects a local install.
 This has only been syntax-checked, not run against a real MAPDL session.
 
 Usage:
-    python simulate_pyansys_benchmark.py data/samples/rv3032_real
-    python simulate_pyansys_benchmark.py data/samples/rv3032_real --nx 50 --ny 50 --delta-t 100
+    python simulate_pyansys_benchmark.py data/samples/rv3032_example
+    python simulate_pyansys_benchmark.py data/samples/rv3032_example --nx 50 --ny 50 --delta-t 100
 """
 
 from __future__ import annotations
@@ -63,13 +58,11 @@ _ELEM_TYPE_ID = 1
 
 
 # ---------------------------------------------------------------------------
-# Mesh construction -- mirrors simulate_tensile.py's create_layered_mesh()
-# node-grid scheme exactly, just emitted as APDL N/E commands instead of a
-# dolfinx mesh, and using ANSYS's own I-J-K-L-M-N-O-P brick node order
-# (a proper CCW quad loop on the bottom face, then the matching top face --
-# NOT the same node order as basix's hexahedron convention, which is a
-# tensor-product/lexicographic order that would produce a twisted element
-# if handed to ANSYS's E command as-is).
+# Mesh construction -- structured node grid emitted as APDL N/E commands,
+# using ANSYS's own I-J-K-L-M-N-O-P brick node order (a proper CCW quad loop
+# on the bottom face, then the matching top face -- a tensor-product /
+# lexicographic node order would produce a twisted element in ANSYS's E
+# command).
 # ---------------------------------------------------------------------------
 
 def _grid_points(Lx_mm: float, Ly_mm: float, z_layers_mm: list[float],
@@ -83,8 +76,8 @@ def _grid_points(Lx_mm: float, Ly_mm: float, z_layers_mm: list[float],
 
 
 def _raster_lookup(xc: float, yc: float, Lx_mm: float, Ly_mm: float, raster: np.ndarray) -> bool:
-    """True if (xc, yc) [mm] falls on a copper pixel. Same convention as
-    simulate_tensile.py's assign_materials(): row -> y, col -> x, threshold 0.5."""
+    """True if (xc, yc) [mm] falls on a copper pixel. Raster convention:
+    row -> y, col -> x, threshold 0.5."""
     ny_map, nx_map = raster.shape
     ix = min(int(xc / Lx_mm * nx_map), nx_map - 1)
     iy = min(int(yc / Ly_mm * ny_map), ny_map - 1)
@@ -196,8 +189,149 @@ def assign_material_properties(mapdl, materials: dict) -> None:
     mapdl.mp("ALPZ", _FR4_MAT_ID, alpha_fr4_op)
 
 
+HOMOGENIZED_MAT_BASE = 10001
+
+
+def apply_homogenized_board(mapdl, quadtree_json: Path, materials: dict,
+                            board_mat_ids: tuple[int, ...]) -> dict:
+    """Replace the board's copper/FR4 projection by per-leaf homogenized
+    materials: every board element (current MAT in board_mat_ids) gets the
+    orthotropic Voigt-Reuss material of the quadtree leaf containing its
+    centroid (x/y), through the full board thickness -- the leaf properties
+    already describe the whole Cu/FR4/Cu laminate. One MAT per leaf that
+    contains at least one element, IDs from HOMOGENIZED_MAT_BASE.
+
+    Call after the component import and contact generation (both select the
+    board by its copper/FR4 MAT IDs), before /SOLU. Returns a summary dict."""
+    from homogenization import orthotropic_engineering_constants
+
+    qt = json.loads(Path(quadtree_json).read_text())
+    leaves = qt["leaves"]
+    bbox = np.array([leaf["bbox_mm"] for leaf in leaves])   # (n, 4): x0 y0 x1 y1
+
+    mapdl.allsel()
+    node_xy = dict(zip(np.asarray(mapdl.mesh.nnum).tolist(),
+                       np.asarray(mapdl.mesh.nodes)[:, :2].tolist()))
+
+    # mesh.elem rows: field 0 = MAT, field 8 = element number, nodes from
+    # field 10 (first 8 = hex corners; unused slots are 0)
+    elem_ids, centroids = [], []
+    board = set(int(m) for m in board_mat_ids)
+    for row in mapdl.mesh.elem:
+        # board solids only -- contact target elements on the board surface
+        # carry the board's MAT too
+        if int(row[0]) not in board or int(row[1]) != _ELEM_TYPE_ID:
+            continue
+        corners = [int(n) for n in row[10:18] if int(n) > 0]
+        xy = np.array([node_xy[n] for n in corners])
+        elem_ids.append(int(row[8]))
+        centroids.append(xy.mean(axis=0))
+    if not elem_ids:
+        raise RuntimeError(f"No board elements with MAT in {board_mat_ids} found.")
+    c = np.asarray(centroids)
+
+    # leaf index per element: first leaf whose bbox contains the centroid
+    inside = ((c[:, None, 0] >= bbox[None, :, 0]) & (c[:, None, 0] <= bbox[None, :, 2])
+              & (c[:, None, 1] >= bbox[None, :, 1]) & (c[:, None, 1] <= bbox[None, :, 3]))
+    if not inside.any(axis=1).all():
+        raise RuntimeError("Some board element centroids lie in no quadtree leaf -- "
+                           "was quadtree.json built for this board?")
+    leaf_of = inside.argmax(axis=1)
+
+    used = np.unique(leaf_of)
+    mat_of_leaf = {int(li): HOMOGENIZED_MAT_BASE + k for k, li in enumerate(used)}
+    with mapdl.non_interactive:
+        for li, mid in mat_of_leaf.items():
+            for lab, val in orthotropic_engineering_constants(leaves[li], materials).items():
+                mapdl.mp(lab, mid, val)
+        for eid, li in zip(elem_ids, leaf_of):
+            mapdl.emodif(eid, "MAT", mat_of_leaf[int(li)])
+    mapdl.allsel()
+    return {"n_elements": len(elem_ids), "n_materials": len(mat_of_leaf),
+            "n_leaves": len(leaves), "mat_ids": (min(mat_of_leaf.values()), max(mat_of_leaf.values()))}
+
+
+def apply_homogenized_board_zlayers(mapdl, quadtree_json: Path, materials: dict,
+                                    board_mat_ids: tuple[int, ...],
+                                    z_cu_bot_mm: float, z_cu_top_mm: float) -> dict:
+    """Z-direction-exact counterpart to apply_homogenized_board(): instead of
+    smearing a leaf's whole 3-layer laminate (bottom Cu / FR4 core / top Cu)
+    into one through-thickness material applied to every element in that
+    leaf's column, each physical layer gets its own material:
+      - bottom Cu rows (z1 <= z_cu_bot_mm): per-leaf material from phi_bot
+        ALONE (orthotropic_engineering_constants_layer(..., "bottom")).
+      - top Cu rows (z0 >= z_cu_top_mm): per-leaf material from phi_top alone.
+      - FR4 core rows: left untouched -- the core never carries copper
+        (build_mesh_and_materials always paints it FR4, in every leaf), so it
+        is already exactly right and needs no per-leaf homogenization.
+    Same leaf-lookup (by element centroid x/y) and MAT-id-per-leaf scheme as
+    apply_homogenized_board(), just one material set per (leaf, side) instead
+    of one per leaf. IDs from HOMOGENIZED_MAT_BASE, bottom-side first.
+
+    Call after the component import and contact generation (both select the
+    board by its copper/FR4 MAT IDs), before /SOLU. Returns a summary dict."""
+    from homogenization import orthotropic_engineering_constants_layer
+
+    qt = json.loads(Path(quadtree_json).read_text())
+    leaves = qt["leaves"]
+    bbox = np.array([leaf["bbox_mm"] for leaf in leaves])   # (n, 4): x0 y0 x1 y1
+
+    mapdl.allsel()
+    node_xyz = dict(zip(np.asarray(mapdl.mesh.nnum).tolist(),
+                        np.asarray(mapdl.mesh.nodes)[:, :3].tolist()))
+
+    # mesh.elem rows: field 0 = MAT, field 8 = element number, nodes from
+    # field 10 (first 8 = hex corners; unused slots are 0)
+    elem_ids, centroids, sides = [], [], []
+    board = set(int(m) for m in board_mat_ids)
+    tol = 1e-6 * max(1.0, z_cu_top_mm)
+    for row in mapdl.mesh.elem:
+        # board solids only -- contact target elements on the board surface
+        # carry the board's MAT too
+        if int(row[0]) not in board or int(row[1]) != _ELEM_TYPE_ID:
+            continue
+        corners = [int(n) for n in row[10:18] if int(n) > 0]
+        xyz = np.array([node_xyz[n] for n in corners])
+        z0, z1 = xyz[:, 2].min(), xyz[:, 2].max()
+        if z1 <= z_cu_bot_mm + tol:
+            side = "bottom"
+        elif z0 >= z_cu_top_mm - tol:
+            side = "top"
+        else:
+            continue   # FR4 core row: leave as-is, already plain FR4
+        elem_ids.append(int(row[8]))
+        centroids.append(xyz[:, :2].mean(axis=0))
+        sides.append(side)
+    if not elem_ids:
+        raise RuntimeError(f"No bottom/top copper-layer board elements with MAT in "
+                           f"{board_mat_ids} found (z_cu_bot={z_cu_bot_mm}, z_cu_top={z_cu_top_mm}).")
+    c = np.asarray(centroids)
+
+    # leaf index per element: first leaf whose bbox contains the centroid
+    inside = ((c[:, None, 0] >= bbox[None, :, 0]) & (c[:, None, 0] <= bbox[None, :, 2])
+              & (c[:, None, 1] >= bbox[None, :, 1]) & (c[:, None, 1] <= bbox[None, :, 3]))
+    if not inside.any(axis=1).all():
+        raise RuntimeError("Some board element centroids lie in no quadtree leaf -- "
+                           "was quadtree.json built for this board?")
+    leaf_of = inside.argmax(axis=1)
+
+    used = sorted(set(zip(leaf_of.tolist(), sides)))   # (leaf_idx, side) pairs actually present
+    mat_of = {key: HOMOGENIZED_MAT_BASE + k for k, key in enumerate(used)}
+    with mapdl.non_interactive:
+        for (li, side), mid in mat_of.items():
+            for lab, val in orthotropic_engineering_constants_layer(leaves[li], materials, side).items():
+                mapdl.mp(lab, mid, val)
+        for eid, li, side in zip(elem_ids, leaf_of, sides):
+            mapdl.emodif(eid, "MAT", mat_of[(int(li), side)])
+    mapdl.allsel()
+    n_leaves_used = len({li for li, _ in used})
+    return {"n_elements": len(elem_ids), "n_materials": len(mat_of),
+            "n_leaves": len(leaves), "n_leaves_used": n_leaves_used,
+            "mat_ids": (min(mat_of.values()), max(mat_of.values()))}
+
+
 def apply_321_fixture(mapdl, node_ids: dict) -> None:
-    """Same 3-2-1 fixture as simulate_tensile.py's build_cte_bcs(): removes
+    """3-2-1 fixture: removes
     all 6 rigid-body modes without restraining free thermal expansion."""
     n0, n1, n2 = node_ids["corner_000"], node_ids["corner_Lx00"], node_ids["corner_0Ly0"]
     mapdl.d(n0, "UX", 0)
@@ -220,7 +354,7 @@ def solve_thermal_step(mapdl, ref_temp_c: float, delta_t: float) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Post-processing / QoI -- mirrors simulate_joint_qoi.py's evaluate_from_fe()
+# Post-processing / QoI
 # ---------------------------------------------------------------------------
 
 def evaluate_from_mapdl(mapdl, node_ids: dict,

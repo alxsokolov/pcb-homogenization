@@ -45,32 +45,93 @@ def load_thermal_profile(path: Path) -> ThermalProfile:
     return ThermalProfile(time_s=time_s, temp_c=temp_c, reference_temp_c=reference_temp_c)
 
 
+def cold_dwell_start_times(profile: ThermalProfile) -> list[float]:
+    """Thermal-cycle boundaries: the time each hold at the profile's minimum
+    temperature begins (JEDEC-style dwell / ramp-up / dwell / ramp-down
+    cycles, counted cold-dwell-start to cold-dwell-start). Every profile
+    point is a load-step end, so these times are always stored result sets.
+    N boundaries give N-1 full cycles."""
+    at_min = profile.temp_c <= profile.temp_c.min() + 1e-6
+    return [float(profile.time_s[i]) for i in range(len(at_min))
+            if at_min[i] and (i == 0 or not at_min[i - 1])]
+
+
+def plot_thermal_profile(profile: ThermalProfile, out_path: Path, title: str | None = None) -> None:
+    """The applied load as given: one marker per profile point (= load-step
+    end), straight ramps in between -- exactly what apply_thermal_profile()
+    hands to MAPDL, so it can be checked before a solve is started."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(7.5, 4.5))
+    ax.plot(profile.time_s, profile.temp_c, "-o", color="#eb6834", linewidth=2, markersize=6,
+            markeredgecolor="white", markeredgewidth=0.8, label="load-step end")
+    ax.axhline(profile.reference_temp_c, color="#5b6470", linewidth=1, linestyle="--",
+               label=f"TREF = {profile.reference_temp_c:g} °C")
+    for i, t in enumerate(cold_dwell_start_times(profile)):
+        ax.axvline(t, color="#2a78d6", linewidth=1, linestyle=":",
+                   label="cycle boundary" if i == 0 else None)
+    ax.set_xlabel("Time [s]")
+    ax.set_ylabel("Applied temperature [°C]")
+    ax.set_title(title or "Applied temperature profile", fontweight="bold")
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.grid(True, alpha=0.4)
+    ax.legend(frameon=False, fontsize=9, loc="center right")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
 def apply_thermal_profile(mapdl, profile: ThermalProfile) -> None:
     """Drives the current /SOLU session through the profile.
 
-    APDL's default KBC,0 (ramped) load-step behavior linearly interpolates
-    BF,TEMP between each load step's start and end value over that step's
-    own TIME span -- so a piecewise-linear input profile needs nothing
-    more than one TIME + BFUNIF + SOLVE per segment; no custom
-    sub-stepping/interpolation of our own is needed. A "dwell" segment
-    (consecutive points at the same temperature, e.g. this project's
-    1800s/3600s room-temp hold) works the same way -- the ramp's start and
-    end value are simply equal, so nothing changes over that step.
+    The uniform temperature is a TIME table (BFUNIF,TEMP,%TPROFILE%) holding
+    the whole profile, so MAPDL evaluates the exact profile temperature at
+    every substep. This deliberately does NOT rely on KBC,0 ramping between
+    per-step BFUNIF values: in the first load step that ramp starts from
+    TUNIF -- which BFUNIF,TEMP itself overwrites -- so the first segment was
+    silently applied as a step change instead of a ramp (seen in solved
+    results: 22C already at t=1s of a 205->22C/1800s cool-down).
+
+    One load step per segment is still solved (TIME = segment end), so
+    load-step boundaries stay at profile points -- plot_cycle_creep_increment.py
+    relies on that (cycle boundaries are looked up by profile time).
 
     TREF is set to profile.reference_temp_c (the profile's first point,
-    unless the YAML overrode it -- see this module's docstring). Note the
-    BF,TEMP ramp still starts from profile.temp_c[0] (the profile's actual
-    first temperature) regardless of reference_temp_c, so if the two
-    differ, the model already carries a small residual thermal strain at
-    t=0 rather than starting perfectly stress-free -- a deliberate,
-    documented approximation in that case, not a bug.
+    unless the YAML overrode it -- see this module's docstring). If the two
+    differ, the model carries a residual thermal strain at t=0 rather than
+    starting stress-free.
 
     Call this once, after entering /SOLU and setting ANTYPE/RATE/OUTRES,
     before any SOLVE.
     """
     mapdl.tref(profile.reference_temp_c)
-    mapdl.bfunif("TEMP", profile.temp_c[0])
-    for t, temp in zip(profile.time_s[1:], profile.temp_c[1:]):
+    table = np.column_stack([profile.time_s, profile.temp_c])
+    mapdl.load_table("TPROFILE", table, "TIME")
+    mapdl.bfunif("TEMP", "%TPROFILE%")
+    for t in profile.time_s[1:]:
         mapdl.time(float(t))
-        mapdl.bfunif("TEMP", float(temp))
         mapdl.solve()
+
+
+def main() -> None:
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="Plot a thermal profile YAML as it will be applied (no simulation needed).")
+    parser.add_argument("profile", type=Path, help="e.g. configs/thermal_profile_example.yaml")
+    parser.add_argument("--out-png", type=Path, default=None,
+                        help="Output PNG; defaults to <profile>.png next to the YAML")
+    args = parser.parse_args()
+
+    profile = load_thermal_profile(args.profile)
+    out = args.out_png if args.out_png is not None else args.profile.with_suffix(".png")
+    plot_thermal_profile(profile, out, title=args.profile.stem)
+    bounds = cold_dwell_start_times(profile)
+    print(f"{profile.time_s.size - 1} load steps over {profile.time_s[-1]:.0f} s, "
+          f"TREF {profile.reference_temp_c:g} C, {max(len(bounds) - 1, 0)} full cycle(s)")
+    print(f"Wrote {out}")
+
+
+if __name__ == "__main__":
+    main()

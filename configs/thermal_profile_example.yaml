@@ -1,24 +1,23 @@
 # Shortened example profile for quick demonstration runs -- NOT for fatigue evaluation.
 #
-# Same reflow cool-down and the same -40C/125C ramp rates as
-# thermal_profile.yaml, but:
-#   - no 1800 s room-temperature dwell after reflow,
-#   - 2 thermal cycles instead of 3+,
-#   - 300 s dwells at -40C / 125C instead of 900 s (less creep relaxation per
-#     cycle, so per-cycle creep increments come out smaller than the full run).
-# Two cycles are the minimum for plot_cycle_creep_increment.py to show a
-# cycle-to-cycle comparison.
+# Starts at the stress-free reference temperature (TREF = 180C, the upper
+# end of the solder's material data) so the solve begins from an
+# undeformed state. Then:
+#   - fast cool-down 180C -> 22C in 600 s, followed by a 300 s hold at room
+#     temperature,
+#   - one -40C/125C thermal cycle with 300 s holds (the full profile in
+#     thermal_profile.yaml uses 900 s holds),
+#   - a final 300 s hold at -40C, so the cycle boundary at its start is a
+#     load-step boundary for plot_cycle_creep_increment.py.
+# Plot it without simulating:  python thermal_profile.py configs/thermal_profile_example.yaml
 reference_temp_c: 180
 profile:
-  - [0,     205]   # reflow peak -- stress-free reference temperature
-  - [1800,  22]    # cool to room temp
-  - [2172,  -40]
-  - [2472,  -40]
-  - [3462,  125]
-  - [3762,  125]
-  - [4752,  -40]
-  - [5052,  -40]
-  - [6042,  125]
-  - [6342,  125]
-  - [7332,  -40]
-  - [7632,  -40]
+  - [0,     180]   # stress-free reference temperature
+  - [600,   22]    # cool to room temp
+  - [900,   22]    # hold at room temp
+  - [1272,  -40]
+  - [1572,  -40]
+  - [2562,  125]
+  - [2862,  125]
+  - [3852,  -40]
+  - [4152,  -40]

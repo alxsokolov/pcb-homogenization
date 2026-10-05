@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 Per-cycle zone-averaged creep-strain increment, split out of the full
-CRACC_zone(t) history (zone_creep_strain.py) using thermal-cycle boundaries
-found in the applied temperature history (temperature_history.py).
+CRACC_zone(t) history (zone_creep_strain.py) using the thermal-cycle
+boundaries of the applied profile (thermal_profile.cold_dwell_start_times()
+on the profile copy simulate_pyansys_assembly.py saves next to the results).
 
 Why per-cycle and not the run's total: Coffin-Manson-type fatigue laws
 (Nf = C * (delta_eps_creep)^-n) take a *per-cycle* strain range as input.
@@ -14,13 +15,13 @@ has actually stabilized before picking a value for the fatigue law.
 
 Cycle-boundary detection: a thermal cycle here is cold-dwell-start to
 cold-dwell-start (JEDEC-style profile: dwell / ramp-up / dwell / ramp-down,
-repeated). Boundaries are the first sample of each contiguous run at the
-profile's minimum temperature -- robust to the irregular autotime-stepped
-sampling (many result sets landing on the same flat dwell) without assuming
-a fixed dwell temperature or duration. N boundaries give N-1 full cycles.
+repeated). Boundaries come straight from the profile points; every profile
+point is a load-step end and therefore a stored result set, so each boundary
+is looked up exactly in the creep history's time grid. N boundaries give
+N-1 full cycles.
 
 Usage:
-    python plot_cycle_creep_increment.py data/samples/rv3032_real
+    python plot_cycle_creep_increment.py data/samples/rv3032_example
 """
 
 from __future__ import annotations
@@ -34,6 +35,8 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+from thermal_profile import ThermalProfile, cold_dwell_start_times, load_thermal_profile
 
 plt.rcParams.update({
     "font.family": "sans-serif",
@@ -53,31 +56,21 @@ plt.rcParams.update({
 })
 
 
-def cold_dwell_start_indices(temp_C: list[float]) -> list[int]:
-    """Index of the first sample in each contiguous run at the profile's
-    minimum temperature -- one per cold dwell, in time order."""
-    temp = np.asarray(temp_C)
-    at_min = temp <= temp.min() + 1e-6
-    starts = np.where(at_min & ~np.roll(at_min, 1))[0]
-    if at_min[0]:
-        starts = starts[starts != 0]
-        starts = np.insert(starts, 0, 0)
-    return starts.tolist()
-
-
-def per_cycle_increments(zone_history: dict, temp_history: dict) -> dict:
+def per_cycle_increments(zone_history: dict, profile: ThermalProfile) -> dict:
     zt = np.asarray(zone_history["time_s"])
     zc = np.asarray(zone_history["cracc_zone"])
-    tt = np.asarray(temp_history["time_s"])
 
-    if not np.allclose(zt, tt):
-        raise ValueError("zone_creep_strain.json and temperature_history.json were computed "
-                         "on different result-set time grids -- regenerate both from the same .rst")
-
-    boundary_idx = cold_dwell_start_indices(temp_history["temp_C"])
-    if len(boundary_idx) < 2:
-        raise ValueError(f"Only {len(boundary_idx)} cold-dwell boundary found -- need at least 2 "
-                         "(i.e. one full cycle) to compute a per-cycle increment")
+    boundary_t = cold_dwell_start_times(profile)
+    if len(boundary_t) < 2:
+        raise ValueError(f"Only {len(boundary_t)} cold-dwell boundary in the profile -- need at "
+                         "least 2 (i.e. one full cycle) to compute a per-cycle increment")
+    boundary_idx = []
+    for t in boundary_t:
+        hit = np.where(np.isclose(zt, t, rtol=0, atol=1e-6 * max(1.0, abs(t))))[0]
+        if hit.size == 0:
+            raise ValueError(f"Cycle boundary t={t:g}s is not a stored result set -- was the .rst "
+                             "solved with this thermal profile?")
+        boundary_idx.append(int(hit[0]))
 
     cycles = []
     for i in range(len(boundary_idx) - 1):
@@ -124,9 +117,9 @@ def main() -> None:
     parser.add_argument("--zone-json", type=Path, default=None,
                         help="Output of zone_creep_strain.py; defaults to "
                              "<sample_dir>/results/zone_creep_strain.json")
-    parser.add_argument("--temp-json", type=Path, default=None,
-                        help="Output of temperature_history.py; defaults to "
-                             "<sample_dir>/results/temperature_history.json")
+    parser.add_argument("--thermal-profile", type=Path, default=None,
+                        help="Profile the .rst was solved with; defaults to the copy "
+                             "simulate_pyansys_assembly.py saves, <sample_dir>/results/thermal_profile.yaml")
     parser.add_argument("--out", type=Path, default=None,
                         help="Output JSON path; defaults to "
                              "<sample_dir>/results/cycle_creep_increment.json")
@@ -137,14 +130,14 @@ def main() -> None:
 
     results_dir = args.sample_dir / "results"
     zone_json = args.zone_json if args.zone_json is not None else results_dir / "zone_creep_strain.json"
-    temp_json = args.temp_json if args.temp_json is not None else results_dir / "temperature_history.json"
-    for p in (zone_json, temp_json):
+    profile_yaml = (args.thermal_profile if args.thermal_profile is not None
+                    else results_dir / "thermal_profile.yaml")
+    for p in (zone_json, profile_yaml):
         if not p.exists():
-            sys.exit(f"Not found: {p} -- run zone_creep_strain.py / temperature_history.py first")
+            sys.exit(f"Not found: {p} -- run simulate_pyansys_assembly.py / zone_creep_strain.py first")
 
     zone_history = json.loads(zone_json.read_text())
-    temp_history = json.loads(temp_json.read_text())
-    result = per_cycle_increments(zone_history, temp_history)
+    result = per_cycle_increments(zone_history, load_thermal_profile(profile_yaml))
 
     print(f"{len(result['cycles'])} full cycle(s) found "
          f"(boundaries at t={[f'{t:.1f}' for t in result['boundary_time_s']]} s)")

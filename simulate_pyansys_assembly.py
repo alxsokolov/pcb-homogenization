@@ -28,9 +28,10 @@ opened in a separately-launched, standalone ANSYS Mechanical APDL GUI
 why it crashes in this environment), or read directly and plotted via
 plot_creep_strain_history.py without a live MAPDL session at all.
 
-Placement is manual only for now: --place-x-mm/--place-y-mm/--rotation-deg.
-Auto-placement from Gerber/production data is a likely follow-up, not
-built here.
+Placement: by default the component is centred on the PAD_1/PAD_2 midpoint
+from solder_reliability.py and rotated onto the pad axis; --place-x-mm/
+--place-y-mm/--rotation-deg override that. Reading pads from Gerber/production
+data automatically is a likely follow-up, not built here.
 
 --inspect stops right after placement (before contact generation/solve)
 and opens an interactive PyVista/VTK plot (mapdl.eplot()) of the live
@@ -49,10 +50,10 @@ attach the legacy GUI to a saved database -- eplot() does neither, so
 it's both more reliable here and lighter-weight.
 
 Usage:
-    python simulate_pyansys_assembly.py data/samples/rv3032_real
-    python simulate_pyansys_assembly.py data/samples/rv3032_real --place-x-mm 18 --place-y-mm 10.8 --rotation-deg 90
-    python simulate_pyansys_assembly.py data/samples/rv3032_real --inspect
-    python simulate_pyansys_assembly.py data/samples/rv3032_real --creep --thermal-profile configs/thermal_profile.yaml
+    python simulate_pyansys_assembly.py data/samples/rv3032_example
+    python simulate_pyansys_assembly.py data/samples/rv3032_example --place-x-mm 15 --place-y-mm 12.375 --rotation-deg 90
+    python simulate_pyansys_assembly.py data/samples/rv3032_example --inspect
+    python simulate_pyansys_assembly.py data/samples/rv3032_example --creep --thermal-profile configs/thermal_profile.yaml
 """
 
 from __future__ import annotations
@@ -80,11 +81,13 @@ from simulate_pyansys_benchmark import (
     _CU_MAT_ID,
     _FR4_MAT_ID,
     apply_321_fixture,
+    apply_homogenized_board,
+    apply_homogenized_board_zlayers,
     assign_material_properties,
     build_mesh_and_materials,
 )
 from solder_reliability import PAD_1_XY_MM, PAD_2_XY_MM
-from thermal_profile import apply_thermal_profile, load_thermal_profile
+from thermal_profile import apply_thermal_profile, load_thermal_profile, plot_thermal_profile
 
 # From inspecting DemonstratorB_CR0805_Export.cdb directly (see
 # data/components/cr0805/MANIFEST.md for the full derivation): the file's
@@ -129,8 +132,10 @@ def main() -> None:
                              "PAD_1/PAD_2 midpoint from solder_reliability.py")
     parser.add_argument("--place-y-mm", type=float, default=None,
                         help="Component's local (0,0) target Y on the board; see --place-x-mm")
-    parser.add_argument("--rotation-deg", type=int, choices=(0, 90), default=0,
-                        help="In-plane rotation about the component's local origin")
+    parser.add_argument("--rotation-deg", type=int, choices=(0, 90), default=None,
+                        help="In-plane rotation about the component's local origin. Default: "
+                             "aligned with the PAD_1/PAD_2 axis from solder_reliability.py "
+                             "(the archive's component lies along x, so pads along y -> 90)")
     parser.add_argument("--inspect", action="store_true",
                         help="Open an interactive VTK plot (mapdl.eplot()) right after "
                              "placement, then exit without generating contact or solving "
@@ -142,17 +147,27 @@ def main() -> None:
     parser.add_argument("--creep", action="store_true",
                         help="Leave creep active (RATE,ON, as authored by --solder-mac) instead "
                              "of the default elastic-only check (RATE,OFF)")
-    parser.add_argument("--creep-ratio-limit", type=float, default=10.0,
-                        help="CUTCONTROL,CRPLIMIT value (only applied when --creep is given): "
-                             "max creep-strain-increment/elastic-strain ratio allowed per substep "
-                             "before MAPDL cuts the time step back. Defaulted higher than ANSYS's "
-                             "own tighter default to allow bigger/faster substeps for quick first "
-                             "runs -- dial back down (e.g. 1) for a final, more accurate solve.")
+    parser.add_argument("--creep-ratio-limit", type=float, default=None,
+                        help="Force a creep ratio limit (CUTCONTROL,CRPLIMIT,<value>,1; only with "
+                             "--creep): max creep-strain-increment/elastic-strain ratio per "
+                             "substep before MAPDL cuts the time step back. Default: not issued, "
+                             "so MAPDL's automatic time stepping applies (no creep ratio control "
+                             "for implicit creep). The trailing 1 is required for implicit creep "
+                             "-- without it MAPDL silently ignores the limit.")
     parser.add_argument("--mapdl-dir", type=Path, default=Path("mapdl_run"),
                         help="MAPDL working directory (job files, incl. file0.out/file0.err for "
                              "live progress -- see the tail command printed at startup). Fixed "
                              "and persistent, unlike launch_mapdl()'s default random temp "
                              "directory, which also gets deleted on exit.")
+    parser.add_argument("--board-model", choices=["projection", "homogenized", "homogenized_zlayers"],
+                        default="projection",
+                        help="projection: each board element is pure copper or FR4 from the raster "
+                             "at its centre. homogenized: each board element gets the orthotropic "
+                             "Voigt-Reuss material of the quadtree leaf containing it, smeared through "
+                             "the full thickness. homogenized_zlayers: z-resolved -- each of the two "
+                             "copper layers gets its OWN per-leaf homogenized material (from phi_bot / "
+                             "phi_top alone), the FR4 core stays plain FR4 untouched (it never carries "
+                             "copper). Both homogenized modes need mesh/quadtree.json from quadtree.py.")
     parser.add_argument("--nproc", type=int, default=os.cpu_count(),
                         help="Distributed MAPDL (DMP) core count -- defaults to all logical cores "
                              "on this machine (launch_mapdl()'s own default is just 2). Your ANSYS "
@@ -169,6 +184,10 @@ def main() -> None:
         sys.exit(f"Not found: {args.solder_mac}")
     if not args.thermal_profile.exists():
         sys.exit(f"Not found: {args.thermal_profile}")
+    if (args.board_model in ("homogenized", "homogenized_zlayers")
+            and not (sample_dir / "mesh" / "quadtree.json").exists()):
+        sys.exit(f"--board-model {args.board_model} needs {sample_dir / 'mesh' / 'quadtree.json'} "
+                 "-- run quadtree.py first")
     # Resolve to absolute before any MAPDL command (e.g. apply_solder_material's
     # /INPUT) sees them -- confirmed empirically that a relative path here
     # silently fails ("File ... does not exist. The /INPUT command is
@@ -190,7 +209,15 @@ def main() -> None:
     thermal_profile = load_thermal_profile(args.thermal_profile)
     print(f"Thermal profile: {thermal_profile.time_s.size} points, "
          f"{thermal_profile.time_s[0]:.0f}-{thermal_profile.time_s[-1]:.0f} s, "
-         f"reference (reflow) temp={thermal_profile.reference_temp_c:.1f} C\n")
+         f"reference (reflow) temp={thermal_profile.reference_temp_c:.1f} C")
+    # Record the applied load next to the results before solving: a copy of
+    # the profile (plot_cycle_creep_increment.py takes the cycle boundaries
+    # from it) and its plot, so the load can be checked while MAPDL runs.
+    results_dir = sample_dir / "results"
+    results_dir.mkdir(exist_ok=True)
+    shutil.copyfile(args.thermal_profile, results_dir / "thermal_profile.yaml")
+    plot_thermal_profile(thermal_profile, results_dir / "thermal_profile.png")
+    print(f"Wrote {results_dir / 'thermal_profile.yaml'}\nWrote {results_dir / 'thermal_profile.png'}\n")
 
     Lx_mm = meta["board"]["width_mm"]
     Ly_mm = meta["board"]["height_mm"]
@@ -200,6 +227,10 @@ def main() -> None:
 
     place_x = args.place_x_mm if args.place_x_mm is not None else (PAD_1_XY_MM[0] + PAD_2_XY_MM[0]) / 2
     place_y = args.place_y_mm if args.place_y_mm is not None else (PAD_1_XY_MM[1] + PAD_2_XY_MM[1]) / 2
+    if args.rotation_deg is None:
+        # the archive's component has its length along x; turn it onto the pad axis
+        pads_along_y = abs(PAD_1_XY_MM[1] - PAD_2_XY_MM[1]) > abs(PAD_1_XY_MM[0] - PAD_2_XY_MM[0])
+        args.rotation_deg = 90 if pads_along_y else 0
 
     print(f"Board {Lx_mm:.1f} x {Ly_mm:.1f} mm, top surface z={Lz_mm:.4f} mm")
     print(f"Placing component local (0,0) at ({place_x:.3f}, {place_y:.3f}) mm, "
@@ -289,16 +320,40 @@ def main() -> None:
             sys.exit("Contact pair has an empty side -- assembly is not connected, aborting "
                      "before solve.")
 
+        if args.board_model == "homogenized":
+            # last step before /SOLU: component import and contact generation
+            # above both select the board by its copper/FR4 MAT IDs
+            summary = apply_homogenized_board(
+                mapdl, sample_dir / "mesh" / "quadtree.json", materials,
+                (_BOARD_CU_MAT_REMAPPED, _BOARD_FR4_MAT_REMAPPED))
+            print(f"Board homogenized from mesh/quadtree.json: {summary['n_elements']} board "
+                  f"elements -> {summary['n_materials']} orthotropic materials (MAT "
+                  f"{summary['mat_ids'][0]}-{summary['mat_ids'][1]}, from "
+                  f"{summary['n_leaves']} leaves)\n")
+        elif args.board_model == "homogenized_zlayers":
+            summary = apply_homogenized_board_zlayers(
+                mapdl, sample_dir / "mesh" / "quadtree.json", materials,
+                (_BOARD_CU_MAT_REMAPPED, _BOARD_FR4_MAT_REMAPPED), z_cu_bot_mm, z_cu_top_mm)
+            print(f"Board homogenized per z-layer from mesh/quadtree.json: {summary['n_elements']} "
+                  f"copper-layer elements -> {summary['n_materials']} orthotropic materials (MAT "
+                  f"{summary['mat_ids'][0]}-{summary['mat_ids'][1]}, from {summary['n_leaves_used']}/"
+                  f"{summary['n_leaves']} leaves used, bottom+top sides); FR4 core rows left as "
+                  f"plain FR4 (MAT {_BOARD_FR4_MAT_REMAPPED})\n")
+
         mapdl.allsel()
         mapdl.finish()
         mapdl.slashsolu()
         if args.creep:
             mapdl.rate("on")
-            # Relaxes the creep-ratio substep cutback criterion -- see
-            # --creep-ratio-limit's help text. No effect (and not issued)
-            # when creep is off, since there's no creep ratio to limit.
-            mapdl.cutcontrol("CRPLIMIT", args.creep_ratio_limit)
-            print(f"Creep ON for this solve (CRPLIMIT={args.creep_ratio_limit})\n")
+            # Only forced when asked for -- see --creep-ratio-limit's help
+            # text. Option 1 = implicit creep (the SAC305 law is implicit);
+            # without it MAPDL reports "CRITERION FOR CREEP RATIO CONTROL =
+            # none" and the limit has no effect.
+            if args.creep_ratio_limit is not None:
+                mapdl.cutcontrol("CRPLIMIT", args.creep_ratio_limit, 1)
+                print(f"Creep ON for this solve (CRPLIMIT={args.creep_ratio_limit}, forced)\n")
+            else:
+                print("Creep ON for this solve (creep ratio control: MAPDL automatic)\n")
         else:
             # RATE,OFF deactivates implicit creep integration session-wide;
             # the solder's TB,CREEP table (from --solder-mac) stays defined,
@@ -312,12 +367,9 @@ def main() -> None:
         # plot (e.g. plot_creep_strain_history.py) to have more than one
         # point per segment to plot.
         mapdl.outres("ALL", "ALL")
-        # One ramped load step per consecutive pair of profile points --
-        # each has its own explicit end TIME, so (unlike an open-ended
-        # single ramp) AUTOTS always has a real target to stop at instead
-        # of auto-growing the step size indefinitely. See
-        # thermal_profile.apply_thermal_profile()'s docstring for why a
-        # piecewise-linear profile needs nothing more than this.
+        # One load step per consecutive pair of profile points -- each has
+        # its own explicit end TIME, so AUTOTS always has a real target to
+        # stop at. See thermal_profile.apply_thermal_profile().
         apply_thermal_profile(mapdl, thermal_profile)
         mapdl.finish()
         print(f"\nThermal profile solve completed: {thermal_profile.time_s.size} points over "
@@ -326,8 +378,6 @@ def main() -> None:
              f"({'creep active' if args.creep else 'elastic-only, creep off'}).")
 
         mapdl.save()
-        results_dir = sample_dir / "results"
-        results_dir.mkdir(exist_ok=True)
         db_src = Path(mapdl.directory) / f"{mapdl.jobname}.db"
         rst_src = Path(mapdl.result_file) if mapdl.result_file else None
         db_dst = results_dir / "pyansys_assembly.db"
