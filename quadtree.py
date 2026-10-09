@@ -216,6 +216,27 @@ def build_quadtree_focused(top_map: np.ndarray, bot_map: np.ndarray,
     return root
 
 
+def build_quadtree_uniform_grid(top_map: np.ndarray, bot_map: np.ndarray,
+                                Lx: float, Ly: float, nx: int, ny: int) -> QuadNode:
+    """Leaves on a regular nx x ny grid instead of an adaptive split -- each
+    leaf's bbox matches exactly one simulate_pyansys_assembly.py board FEM
+    element (same --nx/--ny there), so homogenization is applied per
+    element instead of over a coarser (or differently-shaped) region. Not a
+    quadtree in the adaptive sense used elsewhere in this module -- reuses
+    the same QuadNode/leaf-properties machinery as a flat one-level
+    "forest": a non-leaf root whose children are the nx*ny grid cells
+    directly (apply_homogenized_board() et al. only ever read the flat leaf
+    list back out of quadtree.json, not the tree structure, so this is a
+    drop-in -- see their own bbox-containment lookup)."""
+    root = QuadNode(0.0, 0.0, Lx, Ly, level=0)
+    dx, dy = Lx / nx, Ly / ny
+    root.children = [
+        _make_leaf(top_map, bot_map, Lx, Ly, i * dx, j * dy, (i + 1) * dx, (j + 1) * dy, level=1)
+        for j in range(ny) for i in range(nx)
+    ]
+    return root
+
+
 def collect_leaves(node: QuadNode, out: list | None = None) -> list[QuadNode]:
     if out is None:
         out = []
@@ -352,10 +373,19 @@ def main() -> None:
                              "--focus-margin-mm) instead of toward the most mixed leaves.")
     parser.add_argument("--focus-margin-mm", type=float, default=0.75,
                         help="Margin around the pad bounding box for --focus-component")
+    parser.add_argument("--per-element-grid", type=int, nargs=2, metavar=("NX", "NY"), default=None,
+                        help="Skip the adaptive quadtree entirely: one leaf per regular NX x NY "
+                             "grid cell, matching simulate_pyansys_assembly.py's --nx/--ny board "
+                             "FEM mesh exactly -- so each board element gets its own homogenized "
+                             "material from its own footprint, instead of a coarser (or finer) "
+                             "quadtree region. Mutually exclusive with --max-leaves/"
+                             "--focus-component; --max-level is ignored.")
     parser.add_argument("--materials", type=Path, default=Path("configs/materials.yaml"))
     args = parser.parse_args()
     if args.focus_component and args.max_leaves is None:
         sys.exit("--focus-component needs --max-leaves")
+    if args.per_element_grid and (args.max_leaves is not None or args.focus_component):
+        sys.exit("--per-element-grid is mutually exclusive with --max-leaves/--focus-component")
 
     if not args.sample_dir.exists():
         sys.exit(f"Not found: {args.sample_dir}")
@@ -371,7 +401,14 @@ def main() -> None:
     t_cu = meta["stackup"]["copper_thickness_mm"]
     t_fr4 = meta["stackup"]["dielectric_thickness_mm"]
 
-    if args.focus_component:
+    if args.per_element_grid:
+        nx, ny = args.per_element_grid
+        print(f"Board {Lx:.1f} x {Ly:.1f} mm — building a {nx} x {ny} per-element grid "
+             f"({nx * ny} leaves, one per board FEM element) …")
+        root = build_quadtree_uniform_grid(layer_maps["top"], layer_maps["bottom"], Lx, Ly, nx, ny)
+        n_before = len(collect_leaves(root))
+        criterion = "per_element_uniform_grid"
+    elif args.focus_component:
         from solder_reliability import PAD_1_XY_MM, PAD_2_XY_MM
         m = args.focus_margin_mm
         focus = (min(PAD_1_XY_MM[0], PAD_2_XY_MM[0]) - m, min(PAD_1_XY_MM[1], PAD_2_XY_MM[1]) - m,

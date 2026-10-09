@@ -65,6 +65,8 @@ import shutil
 import sys
 from pathlib import Path
 
+import psutil
+
 from component_import import (
     apply_solder_material,
     compute_safe_offsets,
@@ -114,6 +116,38 @@ _BOARD_FR4_MAT_REMAPPED = 9002
 _DEFAULT_CDB_PATH = Path("data/components/cr0805/DemonstratorB_CR0805_Export.cdb")
 _DEFAULT_MAC_PATH = Path("data/materials/sac305/SAC305_MikroVal.mac")
 
+# Process names PyMAPDL's own mapdl.exit() leaves running on this machine --
+# confirmed empirically (Windows, distributed/DMP launch_mapdl(nproc>1)):
+# exit() talks to the gRPC server (rank 0) over its channel, but the other
+# DMP ranks and the standalone license client don't reliably go down with
+# it, and if the server itself already crashed (e.g. the solver ran out of
+# memory) the gRPC call can't reach it at all -- either way the solver
+# processes (each pinned to this run's own --mapdl-dir as their working
+# directory) are left running, accumulating across repeated runs until
+# something runs out of memory. _force_kill_mapdl_processes() is a
+# best-effort backstop, not a replacement for mapdl.exit(): call both,
+# always, regardless of whether the run succeeded or raised.
+_MAPDL_PROCESS_NAMES = {"ansys.exe", "ansys251.exe"}
+
+
+def _force_kill_mapdl_processes(run_location: str) -> None:
+    run_location = str(Path(run_location).resolve())
+    killed = []
+    for proc in psutil.process_iter(["pid", "name"]):
+        name = (proc.info.get("name") or "").lower()
+        if name not in _MAPDL_PROCESS_NAMES:
+            continue
+        try:
+            if proc.cwd() != run_location:
+                continue
+            proc.kill()
+            killed.append(proc.pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    if killed:
+        print(f"[cleanup] Force-killed {len(killed)} leftover MAPDL process(es) "
+             f"pinned to {run_location}: {killed}")
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -124,6 +158,12 @@ def main() -> None:
     parser.add_argument("--nx", type=int, default=50)
     parser.add_argument("--ny", type=int, default=50)
     parser.add_argument("--nz-per-layer", type=int, default=2)
+    parser.add_argument("--cu-penetration-elements", type=int, default=0,
+                        help="Extends the copper/FR4 raster classification (and, for "
+                             "--board-model homogenized_zlayers, the per-leaf bottom/top "
+                             "material) this many FR4-core z-elements deep from each surface, "
+                             "beyond the true copper thickness. 0 (default) matches the real "
+                             "stackup -- copper only in its own two thin layers.")
     parser.add_argument("--materials", type=Path, default=Path("configs/materials.yaml"))
     parser.add_argument("--cdb", type=Path, default=_DEFAULT_CDB_PATH)
     parser.add_argument("--solder-mac", type=Path, default=_DEFAULT_MAC_PATH)
@@ -224,6 +264,10 @@ def main() -> None:
     z_cu_bot_mm = meta["stackup"]["copper_thickness_mm"]
     z_cu_top_mm = z_cu_bot_mm + meta["stackup"]["dielectric_thickness_mm"]
     Lz_mm = meta["stackup"]["total_thickness_mm"]
+    # One FR4-core element's own z-thickness (the core band spans
+    # z_cu_bot_mm..z_cu_top_mm, divided into nz_per_layer elements like the
+    # two copper bands) -- --cu-penetration-elements counts in these units.
+    cu_penetration_mm = args.cu_penetration_elements * (z_cu_top_mm - z_cu_bot_mm) / args.nz_per_layer
 
     place_x = args.place_x_mm if args.place_x_mm is not None else (PAD_1_XY_MM[0] + PAD_2_XY_MM[0]) / 2
     place_y = args.place_y_mm if args.place_y_mm is not None else (PAD_1_XY_MM[1] + PAD_2_XY_MM[1]) / 2
@@ -233,6 +277,9 @@ def main() -> None:
         args.rotation_deg = 90 if pads_along_y else 0
 
     print(f"Board {Lx_mm:.1f} x {Ly_mm:.1f} mm, top surface z={Lz_mm:.4f} mm")
+    if cu_penetration_mm:
+        print(f"Cu penetration: {args.cu_penetration_elements} FR4-core element(s) "
+             f"({cu_penetration_mm:.4f} mm) beyond the real {z_cu_bot_mm:.3f} mm copper thickness")
     print(f"Placing component local (0,0) at ({place_x:.3f}, {place_y:.3f}) mm, "
          f"rotation={args.rotation_deg} deg\n")
 
@@ -262,7 +309,7 @@ def main() -> None:
     try:
         node_ids = build_mesh_and_materials(
             mapdl, layer_maps, Lx_mm, Ly_mm, z_cu_bot_mm, z_cu_top_mm, Lz_mm,
-            args.nx, args.ny, args.nz_per_layer)
+            args.nx, args.ny, args.nz_per_layer, cu_penetration_mm)
         assign_material_properties(mapdl, materials)
         apply_321_fixture(mapdl, node_ids)
         print(f"Board: {mapdl.mesh.nnum_all.size} nodes, {mapdl.mesh.enum_all.size} elements\n")
@@ -333,7 +380,8 @@ def main() -> None:
         elif args.board_model == "homogenized_zlayers":
             summary = apply_homogenized_board_zlayers(
                 mapdl, sample_dir / "mesh" / "quadtree.json", materials,
-                (_BOARD_CU_MAT_REMAPPED, _BOARD_FR4_MAT_REMAPPED), z_cu_bot_mm, z_cu_top_mm)
+                (_BOARD_CU_MAT_REMAPPED, _BOARD_FR4_MAT_REMAPPED), z_cu_bot_mm, z_cu_top_mm,
+                cu_penetration_mm)
             print(f"Board homogenized per z-layer from mesh/quadtree.json: {summary['n_elements']} "
                   f"copper-layer elements -> {summary['n_materials']} orthotropic materials (MAT "
                   f"{summary['mat_ids'][0]}-{summary['mat_ids'][1]}, from {summary['n_leaves_used']}/"
@@ -392,7 +440,13 @@ def main() -> None:
         print(f"Open {db_dst.name} in a standalone ANSYS Mechanical APDL session "
              f"(File > Resume from...) to inspect in the GUI.")
     finally:
-        mapdl.exit()
+        try:
+            mapdl.exit()
+        except Exception as e:
+            print(f"[warn] mapdl.exit() raised ({e}); force-killing leftover processes instead.")
+        # Backstop regardless of whether exit() above reported success -- see
+        # _force_kill_mapdl_processes()'s docstring for why it's not optional.
+        _force_kill_mapdl_processes(mapdl_run_location)
 
 
 if __name__ == "__main__":

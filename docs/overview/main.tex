@@ -243,28 +243,117 @@ The example run demonstrates the workflow. With one cycle, short holds and a coa
 board mesh that loses most traces under the joint (Fig.~\ref{fig:mapping}), its $\Delta\varepsilon$ is not a
 fatigue value: use the full profile, several cycles and the default mesh for that.
 
-\section{Board-model comparison}
-\mod{plot\_comparison\_creep.py} overlays the zone-averaged creep history and per-cycle $\Delta\varepsilon$ of
-several \mod{simulate\_pyansys\_assembly.py} runs on the same board, read back from their saved
-\code{results/} JSON (no \code{.rst} access needed). \code{--board-model homogenized} gives each board
-element the orthotropic Voigt--Reuss material of its quadtree leaf, smeared through the full thickness;
-\code{homogenized\_zlayers} instead resolves the two copper layers separately -- each gets its own per-leaf
-material from \code{phi\_bot}/\code{phi\_top} alone, and the FR4 core in between stays plain FR4. Both need
-\code{mesh/quadtree.json} from \mod{quadtree.py}.
+\section{Board model and mesh resolution: a summary}
+\label{sec:comparison}
+Three questions, answered together: does the quadtree leaf count matter, does smearing the two
+copper layers into one through-thickness material vs.\ resolving them separately
+(\code{--board-model homogenized} vs.\ \code{homogenized\_zlayers}) matter, and does any of that
+survive mesh refinement? \mod{plot\_delta\_summary.py} collects the per-cycle $\Delta\varepsilon$ of
+eight \mod{simulate\_pyansys\_assembly.py} runs spanning both board-model families and three mesh
+resolutions, read back from their saved \code{results/} JSON (no \code{.rst} access needed) --
+one figure instead of the three separate time-series-plus-bar comparisons an earlier version of
+this report built up one at a time.
 
 \begin{figure}[H]
   \centering
-  \includegraphics[width=\linewidth]{figures/comparison_creep.png}
-  \caption{Zone-averaged accumulated creep strain vs.\ time (left) and the per-cycle increment (right) across
-  four board models of the same \code{rv3032\_example} board: the directly projected copper/FR4 raster,
-  full-resolution homogenization (241 leaves), the coarser 19-leaf quadtree, and the same 19-leaf quadtree
-  with the two copper layers homogenized separately (\code{homogenized\_zlayers}). The coarse quadtree
-  tracks the full-resolution homogenization closely ($\Delta\varepsilon=\num{9.00e-3}$ vs.\
-  \num{9.00e-3}, both $\sim$\SI{6.5}{\percent} above the projection's \num{8.45e-3}), while resolving
-  the copper layers separately pulls $\Delta\varepsilon$ below the projection instead (\num{8.06e-3},
-  $-4.6\,\%$) -- smearing both layers into one orthotropic material over- or under-stiffens the joint
-  differently than keeping them apart.}
+  \includegraphics[width=\linewidth]{figures/delta_summary.png}
+  \caption{Per-cycle $\Delta\varepsilon$ across the study's board-model and mesh-resolution
+  combinations. \textbf{Leaf count barely matters}: at the coarse \numproduct{20 x 20}/
+  \code{nz\_per\_layer=2} mesh, 241 vs.\ 19 smeared leaves land within \SI{0.1}{\percent} of each
+  other ($\num{9.00e-3}$ both); at the fine \numproduct{20 x 20}/\code{nz\_per\_layer=10} mesh, one
+  leaf per element (400 leaves, $z$-resolved, \num{7.44e-3}) sits close to the 19-leaf $z$-resolved
+  result at the coarser mesh (\num{8.06e-3}). \textbf{Smeared vs.\ $z$-resolved is a real but
+  modest effect}: smeared leaves sit $\sim$\SI{6.5}{\percent} above the matching projection
+  (\num{9.00e-3} vs.\ \num{8.45e-3}), $z$-resolved $\sim$\SI{5}{\percent} below it
+  (\num{7.44e-3}--\num{8.06e-3} vs.\ \num{7.87e-3}--\num{8.45e-3}) -- opposite signs, similar
+  magnitude, regardless of leaf count. \textbf{Mesh resolution dominates both}: refining
+  \numproduct{20 x 20}$\to$\numproduct{50 x 50} drops $\Delta\varepsilon$ by \SI{40}{\percent}
+  (\num{7.87e-3}$\to$\num{4.72e-3}, projection) -- confirmed to be a genuine mesh effect, not a
+  material-resolution one, by re-applying the \numproduct{20 x 20}-leaf material to the
+  \numproduct{50 x 50} mesh unchanged (\num{4.77e-3}, within \SI{1.1}{\percent} of the full
+  \numproduct{50 x 50} projection). The \numproduct{20 x 20} mesh is coarse enough to lose or
+  badly distort the thin traces right under the solder joint (visible already in
+  Fig.~\ref{fig:mapping}), so neither coarse-mesh result -- projection or homogenized -- was close
+  to converged to begin with.}
   \label{fig:comparison}
+\end{figure}
+
+Whether \numproduct{50 x 50} itself has converged is still open -- the next check would be
+\numproduct{80 x 80} or finer, at the same \code{nz\_per\_layer=10}.
+
+\section{Leaf resolution vs.\ mesh resolution, swept together}
+\label{sec:leaf-sweep}
+\mod{plot\_leaf\_resolution\_sweep.py} puts two different sweeps on one plot. The \emph{homogenized}
+series re-applies \code{quadtree.py --per-element-grid N N} for $N \in \{5, 10, 25, 50\}$ to the
+\emph{same} \numproduct{50 x 50}, \code{nz\_per\_layer=10} FE mesh throughout -- an in-plane
+\emph{material}-resolution sweep, isolating the homogenization leaf count with the mesh held fixed
+(\S\ref{sec:comparison}'s question). $N$ must divide \numproduct{50 x 50} evenly for every
+leaf to land on a whole number of elements ($N=20$ gives \num{2.5} elements per leaf, so leaf
+boundaries fall mid-element and were dropped from this version of the plot for that reason); $N \in
+\{5, 10, 25, 50\}$ are 50's own divisors. The \emph{projection} series instead re-meshes the binary
+copper/FR4 board itself at $N \in \{20, 30, 50\}$ in-plane, same \code{nz\_per\_layer=10} -- an
+in-plane \emph{mesh}-resolution sweep, the question \S\ref{sec:comparison}'s single
+\numproduct{20 x 20}-vs-\numproduct{50 x 50} comparison first raised. The two series share only the
+plot, not an $x$-axis meaning: $N$ is a leaf count for one, a mesh element count for the other.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.78\linewidth]{figures/leaf_resolution_sweep.png}
+  \caption{Per-cycle $\Delta\varepsilon$ vs.\ resolution $N$: the homogenized leaf sweep (orange,
+  mesh fixed at \numproduct{50 x 50}) against the binary projection's own mesh sweep (green). The
+  projection series swings by \SI{67}{\percent} peak-to-peak as its mesh refines ($\num{7.87e-3}$
+  at $N=20$, $\num{4.98e-3}$ at $N=30$, $\num{4.72e-3}$ at $N=50$) -- confirming
+  \S\ref{sec:comparison}'s finding with a third point: mesh convergence, not a two-point
+  artifact. The homogenized series barely moves across the same range ($\num{4.687e-3}$ to
+  $\num{4.770e-3}$, under \SI{2}{\percent} end to end) and does \emph{not} converge back onto the
+  projection series -- the two land within \SI{1}{\percent} of each other only because both happen
+  to approach the same mesh-converged value by $N=50$, not because either curve is heading toward
+  the other. The conclusion is the same as \S\ref{sec:comparison}'s: FE mesh resolution is the
+  dominant error source in this model by a wide margin; the binary-vs-homogenized modeling choice
+  is a comparatively small, and not mesh-resolution-dependent, second-order effect.}
+  \label{fig:leaf-sweep}
+\end{figure}
+
+\section{Sensitivity to the copper layer's apparent z-thickness}
+The real copper layers are \SI{35}{\micro\metre} thick -- far thinner than one FR4-core element at
+this mesh (\code{nz\_per\_layer=10} over the \SI{1.53}{\milli\metre} core gives \SI{153}{\micro\metre}
+elements, already $\sim$\num{4.4}\texttimes\ the true copper thickness). A new
+\code{--cu-penetration-elements N} option on \mod{simulate\_pyansys\_assembly.py} asks how much that
+mismatch matters: it artificially extends, $N$ extra FR4-core elements deep from each surface, the
+region treated as copper-bearing, with the mesh, in-plane raster/leaf grid and everything else
+unchanged. $N=0$ matches the physical stackup exactly and reuses \S\ref{sec:leaf-sweep}'s $N=50$
+points (\code{rv3032\_projection\_fine}, \code{rv3032\_homog\_leaf50}); $N \in \{1, 3, 5\}$ were run
+fresh for both board models, six solves at the \numproduct{50 x 50}/\code{nz\_per\_layer=10} mesh.
+
+The two board models cannot treat that extra depth the same way. Binary projection paints each
+element wholly copper or wholly FR4 -- it has no way to represent a thinner copper film within a
+thicker element, so painting the penetrated rows copper (the raster's own pattern, repeated at each
+depth) inevitably adds copper volume that is not physically there, growing with $N$.
+\code{homogenized\_zlayers} \emph{can} represent a fractional copper content, so
+\code{orthotropic\_engineering\_constants\_layer()}'s new \code{dilution} argument keeps that volume
+fixed instead: the leaf's true phi is scaled by $t_\mathrm{Cu}/(t_\mathrm{Cu} + N\,t_\mathrm{core})$
+before the Voigt--Reuss mix, smearing the same real copper amount over the thicker effective region
+rather than repeating it at full density. (An earlier version of this sweep skipped that step and
+just reused each leaf's true-thickness material across the penetrated rows too -- which reproduced
+binary's volume inflation instead of avoiding it, and was corrected before the results below.)
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.78\linewidth]{figures/cu_penetration_sweep.png}
+  \caption{Per-cycle $\Delta\varepsilon$ vs.\ copper penetration depth $N$ (FR4-core elements),
+  binary projection (green) vs.\ homogenized $z$-resolved with volume-conserving dilution (orange),
+  \numproduct{50 x 50}/\code{nz\_per\_layer=10} mesh fixed throughout. The two models could hardly
+  diverge more sharply: binary rises steeply and non-linearly with $N$ ($+36\,\%$ at $N=1$,
+  $+166\,\%$ at $N=3$, $+339\,\%$ at $N=5$), while homogenized stays essentially flat
+  ($-5.7\,\%$, $-8.4\,\%$, $-7.0\,\%$ -- a small, non-monotonic wobble, not a trend). This is the
+  expected consequence of the dilution factor itself collapsing fast ($t_\mathrm{Cu}/(t_\mathrm{Cu}
+  + N\,t_\mathrm{core}) = 0.19, 0.07, 0.04$ at $N=1,3,5$): the penetrated region's effective
+  material converges toward plain FR4 almost immediately, so adding more of it changes little.
+  Binary projection's steep climb is therefore less a statement about the board's real physics than
+  about a structural limitation of binary (non-fractional) material assignment once the FE mesh is
+  coarser than the feature it represents -- a limitation \code{homogenized\_zlayers} does not share,
+  provided the homogenization itself conserves volume as the effective layer thickness changes.}
+  \label{fig:cu-penetration}
 \end{figure}
 
 \end{document}

@@ -13,13 +13,30 @@ directly -- see its MANIFEST.md for the full writeup, and both confirmed
 against a real local MAPDL 2025 R2 session, not just read off the file):
 
   - Node/element IDs: the archive's own IDs are internal to that file and
-    collide with the board's (both start low) unless shifted. NUMOFF here
-    genuinely works -- CDREAD,DB does shift NBLOCK/EBLOCK's own node and
-    element numbers by whatever NUMOFF,NODE/ELEM value is in effect when
-    it reads them. import_component() patches those two lines in the
-    archive text to live-computed, guaranteed-safe values before reading
-    (see _patch_node_elem_numoff()'s docstring for why it patches the text
-    directly rather than the file's own `_CDRDOFF` escape hatch).
+    collide with the board's (both start low) unless shifted -- NUMOFF
+    does **not** work for this, despite first appearances. Patching
+    NUMOFF,NODE/ELEM in the archive text looked like it worked as long as
+    the board stayed small, but a later, larger board (>=11953 elements or
+    >=52372 nodes -- this archive's own fixed node/element ID range,
+    confirmed empirically) proved otherwise: the component landed at the
+    *exact same* absolute IDs (nodes 52372-78731, elements 11953-17276)
+    regardless of what NUMOFF,NODE/ELEM was patched to, silently
+    overwriting whichever board elements happened to already occupy that
+    range. Root cause: NOOFFSET,NODE/ELEM (needed below so CDREAD doesn't
+    auto-renumber the *board's* pre-existing data on collision, see next
+    paragraph) suppresses *all* offsetting of that item during CDREAD, not
+    just the automatic kind -- including an explicit NUMOFF set beforehand.
+    So CDREAD can never be trusted to offset NODE/ELEM here. Instead,
+    _renumber_archive_ids() shifts every node ID (NBLOCK, BFBLOCK) and
+    every element ID + node connectivity (EBLOCK, and CMBLOCK's
+    EVALELEMENTS element-range list) by rewriting the archive's own
+    fixed-width ID fields directly, before the text ever reaches CDREAD --
+    the same text-patching approach already used elsewhere in this module
+    for MAT/TYPE (below) and for UNBL-tagged MPTEMP/MPDATA
+    (reapply_component_materials()). This also means a second (or third)
+    component placement is safe: each call computes its own offsets from
+    the session's current max IDs, so multiple placed instances each land
+    in their own disjoint range, never at the archive's fixed originals.
 
   - Material IDs: NUMOFF,MAT does **not** work the same way -- verified
     empirically (MPLIST/ESEL-by-MAT after import both show the archive's
@@ -82,19 +99,11 @@ on one side, or elements on unexpected faces).
 
 from __future__ import annotations
 
-import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-
-# Matches the NUMOFF,NODE / NUMOFF,ELEM staging lines CDWRITE bakes into
-# the archive header, e.g. "NUMOFF,NODE,    80675". (MAT/TYPE/REAL/CSYS
-# NUMOFF lines exist too but are left untouched -- see module docstring:
-# patching them has no effect on this archive format, so there's nothing
-# to gain and it'd only be misleading to pretend otherwise.)
-_NUMOFF_LINE_RE = re.compile(r"^NUMOFF,\s*(NODE|ELEM)\s*,\s*\d+\s*$", re.MULTILINE)
 
 _VALID_ROTATIONS_DEG = (0, 90)
 
@@ -312,35 +321,160 @@ def reapply_component_materials(mapdl, cdb_path: Path, mat_ids) -> None:
                 mapdl.mpdata(lab, mat_id, start + 1, *v_chunk)
 
 
-def _patch_node_elem_numoff(cdb_text: str, offsets: Offsets) -> str:
-    """Replaces the archive's own baked-in NUMOFF,NODE/NUMOFF,ELEM values
-    (fixed numbers from the partner's export session, unaware of our
-    board) with our live-computed, guaranteed-safe ones.
+def _line_ending(line: str) -> str:
+    stripped = line.rstrip("\r\n")
+    return line[len(stripped):]
 
-    Originally this used the file's own `_CDRDOFF` escape hatch (set it to
-    1 before reading, so the file's `*IF,_CDRDOFF,EQ,1` guard skips its own
-    NUMOFF lines, letting ours -- issued beforehand -- stand instead). That
-    is the standard CDWRITE/CDREAD convention, but PyMAPDL's client-side
-    `run()` refuses to set any parameter starting with `_` ("reserved for
-    the GUI/Mechanical APDL-provided macros"). Patching the NUMOFF lines
-    directly in the text sidesteps that restriction and is just as
-    correct -- arguably more transparent, since it doesn't depend on the
-    *IF block's execution order at all.
+
+def _header_fields(line: str) -> list[str]:
+    """Comma-separated fields of a block header/CMBLOCK line, comment and
+    line ending stripped (CMBLOCK's often carries a trailing "! ..." note)."""
+    return [p.strip() for p in line.split("!")[0].strip().rstrip(",").split(",")]
+
+
+def _shift_field(line: str, start: int, width: int, delta: int) -> str:
+    """Re-renders the width-char integer field at [start:start+width],
+    shifted by delta, right-justified in the same width -- the rest of the
+    line (other fields, line ending) is untouched."""
+    old = int(line[start:start + width])
+    new = old + delta
+    field = f"{new:{width}d}"
+    if len(field) > width:
+        raise ValueError(f"Shifted ID {new} (from {old} + {delta}) no longer fits "
+                         f"the archive's {width}-char field -- offset too large.")
+    return line[:start] + field + line[start + width:]
+
+
+def _split_fields(line: str, width: int) -> tuple[list[str], str]:
+    """A fixed-width data line's integer fields (as ints) and its line
+    ending, for a line containing only width-char fields with no header."""
+    ending = _line_ending(line)
+    body = line[:len(line) - len(ending)] if ending else line
+    n = len(body) // width
+    return [int(body[k * width:(k + 1) * width]) for k in range(n)], ending
+
+
+def _render_fields(values: list[int], width: int, ending: str) -> str:
+    rendered = []
+    for v in values:
+        field = f"{v:{width}d}"
+        if len(field) > width:
+            raise ValueError(f"Shifted ID {v} no longer fits the archive's "
+                             f"{width}-char field -- offset too large.")
+        rendered.append(field)
+    return "".join(rendered) + ending
+
+
+def _shift_all_fields(line: str, width: int, delta: int, *, signed_magnitude: bool = False) -> tuple[str, int]:
+    """Shifts every width-char fixed field on a data line (no header
+    fields mixed in) by delta. signed_magnitude=True shifts |value| and
+    keeps the sign (CMBLOCK's range-pair encoding: a negative value closes
+    the range opened by the preceding positive one). Returns (new_line,
+    n_fields)."""
+    values, ending = _split_fields(line, width)
+    shifted = [(-1 if v < 0 else 1) * (abs(v) + delta) if signed_magnitude else v + delta
+               for v in values]
+    return _render_fields(shifted, width, ending), len(values)
+
+
+def _renumber_nblock_or_bfblock(lines: list[str], i: int, count: int, node_offset: int) -> tuple[list[str], int]:
+    """NBLOCK/BFBLOCK: one data line per entry, node ID in the first
+    9-char field. `count` data lines follow the format-descriptor line."""
+    out = [lines[i]]  # format-descriptor line, unchanged
+    i += 1
+    for _ in range(count):
+        out.append(_shift_field(lines[i], 0, 9, node_offset))
+        i += 1
+    return out, i
+
+
+def _renumber_eblock(lines: list[str], i: int, n_records: int,
+                     node_offset: int, elem_offset: int) -> tuple[list[str], int]:
+    """EBLOCK, format (19i10): each record is a header line (10 attribute
+    fields, then the element ID, then up to 8 node IDs = 19 fields) plus as
+    many pure-node-ID continuation lines (width 10, up to 19 fields each)
+    as the record's own NUMNODES (field 8, 0-based) needs beyond those
+    first 8."""
+    width = 10
+    out = [lines[i]]  # format-descriptor line, unchanged
+    i += 1
+    for _ in range(n_records):
+        fields, ending = _split_fields(lines[i], width)
+        numnodes = fields[8]
+        fields[10] += elem_offset
+        n_header_nodes = min(8, len(fields) - 11)
+        for k in range(11, 11 + n_header_nodes):
+            fields[k] += node_offset
+        out.append(_render_fields(fields, width, ending))
+        i += 1
+        remaining = numnodes - n_header_nodes
+        while remaining > 0:
+            shifted, n = _shift_all_fields(lines[i], width, node_offset)
+            out.append(shifted)
+            remaining -= n
+            i += 1
+    return out, i
+
+
+def _renumber_cmblock_elem(lines: list[str], i: int, count: int, elem_offset: int) -> tuple[list[str], int]:
+    """CMBLOCK,<name>,ELEM: a range-pair list (negative = end of the range
+    opened by the preceding positive value), format (8i10)."""
+    width = 10
+    out = [lines[i]]  # format-descriptor line, unchanged
+    i += 1
+    remaining = count
+    while remaining > 0:
+        shifted, n = _shift_all_fields(lines[i], width, elem_offset, signed_magnitude=True)
+        out.append(shifted)
+        remaining -= n
+        i += 1
+    return out, i
+
+
+def _renumber_archive_ids(cdb_text: str, offsets: Offsets) -> str:
+    """Shifts every node ID (NBLOCK, BFBLOCK) and every element ID + node
+    connectivity (EBLOCK, CMBLOCK's element-range lists) in the archive by
+    offsets.node/offsets.elem, by rewriting the fixed-width ID fields
+    directly -- see the module docstring for why this replaces NUMOFF
+    entirely rather than patching its two header lines (that only ever
+    appeared to work; NOOFFSET,NODE/ELEM, needed to stop CDREAD from
+    renumbering the *board's* pre-existing data instead, silently
+    suppresses NUMOFF's effect too).
+
+    Each block's record layout was reverse-engineered from
+    data/components/cr0805/DemonstratorB_CR0805_Export.cdb directly (see
+    its MANIFEST.md); a differently-exported archive could in principle
+    lay these out differently, but CDWRITE's own format is standardized
+    enough that this should hold for any 2025 R1/R2 CDB.
     """
-    replacements = {"NODE": offsets.node, "ELEM": offsets.elem}
-    seen = set()
-
-    def _sub(m: re.Match) -> str:
-        label = m.group(1)
-        seen.add(label)
-        return f"NUMOFF,{label},{replacements[label]}"
-
-    patched = _NUMOFF_LINE_RE.sub(_sub, cdb_text)
-    missing = set(replacements) - seen
-    if missing:
-        raise RuntimeError(f"Expected NUMOFF lines for {sorted(missing)} not found in archive -- "
-                           "its header format may differ from what this was written against.")
-    return patched
+    lines = cdb_text.splitlines(keepends=True)
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        header = lines[i]
+        stripped = header.strip()
+        if stripped.startswith("NBLOCK,") or stripped.startswith("BFBLOCK,"):
+            fields = _header_fields(stripped)
+            count = int(fields[-2] if stripped.startswith("BFBLOCK,") else fields[-1])
+            out.append(header)
+            block_lines, i = _renumber_nblock_or_bfblock(lines, i + 1, count, offsets.node)
+            out.extend(block_lines)
+            continue
+        if stripped.startswith("EBLOCK,"):
+            count = int(_header_fields(stripped)[-1])
+            out.append(header)
+            block_lines, i = _renumber_eblock(lines, i + 1, count, offsets.node, offsets.elem)
+            out.extend(block_lines)
+            continue
+        if stripped.startswith("CMBLOCK,") and _header_fields(stripped)[2].upper() == "ELEM":
+            count = int(_header_fields(stripped)[-1])
+            out.append(header)
+            block_lines, i = _renumber_cmblock_elem(lines, i + 1, count, offsets.elem)
+            out.extend(block_lines)
+            continue
+        out.append(header)
+        i += 1
+    return "".join(out)
 
 
 def import_component(mapdl, cdb_path: Path, offsets: Offsets) -> ComponentHandle:
@@ -353,23 +487,27 @@ def import_component(mapdl, cdb_path: Path, offsets: Offsets) -> ComponentHandle
     mapdl.allsel()
     nodes_before = set(mapdl.mesh.nnum_all.tolist())
     elems_before = set(mapdl.mesh.enum_all.tolist())
-    patched_text = _patch_node_elem_numoff(cdb_path.read_text(), offsets)
+    patched_text = _renumber_archive_ids(cdb_path.read_text(), offsets)
     with tempfile.NamedTemporaryFile("w", suffix=".cdb", delete=False) as f:
         f.write(patched_text)
         patched_path = Path(f.name)
-    # CDREAD has its own automatic collision-avoidance, independent of the
-    # NUMOFF values patched above: "If a set of data exists prior to the
-    # CDREAD operation, that data set is offset upward to allow the new
-    # data to fit without overlap" (ANSYS CDREAD docs). Confirmed
-    # empirically that this fires regardless of whether the incoming data
-    # actually needs the room -- it silently renumbered the *board's* own
-    # nodes/elements (already offset clear of the archive by our own patch
-    # above), which is not what we want (the board's own node IDs are
-    # referenced elsewhere, e.g. the 3-2-1 fixture applied before this
-    # call). NOOFFSET tells CDREAD not to touch pre-existing NODE/ELEM
-    # numbering -- safe here specifically because we've already guaranteed
-    # via _patch_node_elem_numoff() that the incoming archive's IDs don't
-    # overlap the board's.
+    # CDREAD has its own automatic collision-avoidance: "If a set of data
+    # exists prior to the CDREAD operation, that data set is offset upward
+    # to allow the new data to fit without overlap" (ANSYS CDREAD docs).
+    # Confirmed empirically that this fires regardless of whether the
+    # incoming data actually needs the room -- it silently renumbered the
+    # *board's* own nodes/elements (already clear of the archive by our own
+    # _renumber_archive_ids() above), which is not what we want (the
+    # board's own node IDs are referenced elsewhere, e.g. the 3-2-1 fixture
+    # applied before this call). NOOFFSET tells CDREAD not to touch
+    # pre-existing NODE/ELEM numbering -- safe here because the incoming
+    # archive's IDs have already been shifted clear of the board's in the
+    # text itself, so there's nothing left for CDREAD's own offsetting to
+    # protect against. (It also means NODE/ELEM never depended on NUMOFF in
+    # the first place by the time CDREAD sees this text -- see module
+    # docstring for why NUMOFF,NODE/ELEM can't be trusted here at all: this
+    # same NOOFFSET call silently suppresses it too, not just the automatic
+    # offsetting described above.)
     #
     # This same auto-offset also fires for MAT/TYPE (confirmed empirically
     # via scratch_debug_targe.py: without the NOOFFSET,MAT/TYPE calls
@@ -424,6 +562,11 @@ def import_component(mapdl, cdb_path: Path, offsets: Offsets) -> ComponentHandle
     new_elem_ids = np.array(sorted(elems_after - elems_before), dtype=np.int64)
     if new_node_ids.size == 0:
         raise RuntimeError(f"CDREAD of {cdb_path} added no new nodes -- import failed.")
+    if new_elem_ids.size == 0:
+        raise RuntimeError(f"CDREAD of {cdb_path} added no new elements -- import failed "
+                           "(this is the ID-collision failure mode _renumber_archive_ids() "
+                           "exists to prevent; if you see this, something about the board's "
+                           "current node/element IDs still overlaps the archive's own).")
 
     mapdl.nsel("S", "NODE", "", int(new_node_ids.min()), int(new_node_ids.max()))
     raw_coords = np.asarray(mapdl.mesh.nodes)

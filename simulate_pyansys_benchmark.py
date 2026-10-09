@@ -86,13 +86,24 @@ def _raster_lookup(xc: float, yc: float, Lx_mm: float, Ly_mm: float, raster: np.
 
 def build_mesh_and_materials(mapdl, layer_maps: dict, Lx_mm: float, Ly_mm: float,
                              z_cu_bot_mm: float, z_cu_top_mm: float, Lz_mm: float,
-                             nx: int, ny: int, nz_per_layer: int) -> dict:
+                             nx: int, ny: int, nz_per_layer: int,
+                             cu_penetration_mm: float = 0.0) -> dict:
     """
     Builds the full structured hex mesh directly (N/E commands, batched via
     mapdl.non_interactive) with MAT painted per element from the rasters at
     creation time. Returns a dict of node IDs needed later (BC corners,
     pad-nearest top-surface nodes) so the caller never has to guess/search
     for them geometrically.
+
+    cu_penetration_mm: artificially extends the z-band eligible for the
+    copper/FR4 raster lookup by this many mm beyond the real copper
+    thickness, on both sides, into the FR4 core -- 0 (default) paints only
+    the true copper layers, matching the physical stackup. Used to study
+    how much the solve actually depends on the copper layer's z-extent
+    (data/samples/rv3032_cu_pen*): the FR4 core itself is never physically
+    copper, but at this element size the real 35 um copper thickness is far
+    thinner than a single FR4-core element (nz_per_layer=10 -> 153 um core
+    elements), so this sweep asks how much that mismatch matters.
     """
     x_pts, y_pts, z_pts = _grid_points(Lx_mm, Ly_mm, [0.0, z_cu_bot_mm, z_cu_top_mm, Lz_mm],
                                        nx, ny, nz_per_layer)
@@ -116,12 +127,14 @@ def build_mesh_and_materials(mapdl, layer_maps: dict, Lx_mm: float, Ly_mm: float
     # Vectorized copper/FR4 classification per cell, exactly mirroring
     # assign_materials(): z-band selects which raster (or none, for the
     # always-FR4 core) to look up at the cell's (x,y) centroid.
+    cu_zone_bot_mm = z_cu_bot_mm + cu_penetration_mm
+    cu_zone_top_mm = z_cu_top_mm - cu_penetration_mm
     cu_cells, fr4_cells = [], []
     for k in range(nz):
         zc = (z_pts[k] + z_pts[k + 1]) / 2.0
-        if zc < z_cu_bot_mm:
+        if zc < cu_zone_bot_mm:
             raster = layer_maps.get("bottom")
-        elif zc > z_cu_top_mm:
+        elif zc > cu_zone_top_mm:
             raster = layer_maps.get("top")
         else:
             raster = None
@@ -253,7 +266,8 @@ def apply_homogenized_board(mapdl, quadtree_json: Path, materials: dict,
 
 def apply_homogenized_board_zlayers(mapdl, quadtree_json: Path, materials: dict,
                                     board_mat_ids: tuple[int, ...],
-                                    z_cu_bot_mm: float, z_cu_top_mm: float) -> dict:
+                                    z_cu_bot_mm: float, z_cu_top_mm: float,
+                                    cu_penetration_mm: float = 0.0) -> dict:
     """Z-direction-exact counterpart to apply_homogenized_board(): instead of
     smearing a leaf's whole 3-layer laminate (bottom Cu / FR4 core / top Cu)
     into one through-thickness material applied to every element in that
@@ -261,12 +275,27 @@ def apply_homogenized_board_zlayers(mapdl, quadtree_json: Path, materials: dict,
       - bottom Cu rows (z1 <= z_cu_bot_mm): per-leaf material from phi_bot
         ALONE (orthotropic_engineering_constants_layer(..., "bottom")).
       - top Cu rows (z0 >= z_cu_top_mm): per-leaf material from phi_top alone.
-      - FR4 core rows: left untouched -- the core never carries copper
-        (build_mesh_and_materials always paints it FR4, in every leaf), so it
-        is already exactly right and needs no per-leaf homogenization.
+      - FR4 core rows: left untouched -- the core never carries copper (so
+        long as cu_penetration_mm is 0, build_mesh_and_materials paints it
+        FR4 in every leaf regardless), so it is already exactly right and
+        needs no per-leaf homogenization.
     Same leaf-lookup (by element centroid x/y) and MAT-id-per-leaf scheme as
     apply_homogenized_board(), just one material set per (leaf, side) instead
     of one per leaf. IDs from HOMOGENIZED_MAT_BASE, bottom-side first.
+
+    cu_penetration_mm: must match whatever build_mesh_and_materials() was
+    called with -- extends "bottom"/"top" row classification the same extra
+    distance into the core, so the penetrated rows get the per-leaf bottom/
+    top homogenized material instead of being left at plain FR4 (which would
+    silently discard the penetration on homogenized runs). That material
+    itself is also recomputed at a diluted phi (true copper thickness /
+    (true copper thickness + cu_penetration_mm)) rather than reused
+    undiluted -- the true copper volume does not grow just because it is
+    being represented over a thicker effective region, so smearing it over
+    more z-extent must lower its volume fraction there, the same way the
+    binary/projection model's literal copper cells (which cannot represent
+    a fractional phi at all) unavoidably do add copper volume when forced
+    onto a z-mesh coarser than the true copper thickness.
 
     Call after the component import and contact generation (both select the
     board by its copper/FR4 MAT IDs), before /SOLU. Returns a summary dict."""
@@ -282,6 +311,12 @@ def apply_homogenized_board_zlayers(mapdl, quadtree_json: Path, materials: dict,
 
     # mesh.elem rows: field 0 = MAT, field 8 = element number, nodes from
     # field 10 (first 8 = hex corners; unused slots are 0)
+    cu_zone_bot_mm = z_cu_bot_mm + cu_penetration_mm
+    cu_zone_top_mm = z_cu_top_mm - cu_penetration_mm
+    # z_cu_bot_mm doubles as "true copper thickness" here (both copper layers
+    # share it in this stackup) -- see orthotropic_engineering_constants_layer()'s
+    # dilution docstring for why the per-leaf phi must shrink to match.
+    dilution = z_cu_bot_mm / (z_cu_bot_mm + cu_penetration_mm) if cu_penetration_mm else 1.0
     elem_ids, centroids, sides = [], [], []
     board = set(int(m) for m in board_mat_ids)
     tol = 1e-6 * max(1.0, z_cu_top_mm)
@@ -293,9 +328,9 @@ def apply_homogenized_board_zlayers(mapdl, quadtree_json: Path, materials: dict,
         corners = [int(n) for n in row[10:18] if int(n) > 0]
         xyz = np.array([node_xyz[n] for n in corners])
         z0, z1 = xyz[:, 2].min(), xyz[:, 2].max()
-        if z1 <= z_cu_bot_mm + tol:
+        if z1 <= cu_zone_bot_mm + tol:
             side = "bottom"
-        elif z0 >= z_cu_top_mm - tol:
+        elif z0 >= cu_zone_top_mm - tol:
             side = "top"
         else:
             continue   # FR4 core row: leave as-is, already plain FR4
@@ -319,7 +354,8 @@ def apply_homogenized_board_zlayers(mapdl, quadtree_json: Path, materials: dict,
     mat_of = {key: HOMOGENIZED_MAT_BASE + k for k, key in enumerate(used)}
     with mapdl.non_interactive:
         for (li, side), mid in mat_of.items():
-            for lab, val in orthotropic_engineering_constants_layer(leaves[li], materials, side).items():
+            for lab, val in orthotropic_engineering_constants_layer(
+                    leaves[li], materials, side, dilution).items():
                 mapdl.mp(lab, mid, val)
         for eid, li, side in zip(elem_ids, leaf_of, sides):
             mapdl.emodif(eid, "MAT", mat_of[(int(li), side)])

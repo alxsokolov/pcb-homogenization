@@ -169,13 +169,27 @@ def orthotropic_engineering_constants(leaf: dict, materials: dict) -> dict:
     }
 
 
-def orthotropic_engineering_constants_layer(leaf: dict, materials: dict, side: str) -> dict:
+def orthotropic_engineering_constants_layer(leaf: dict, materials: dict, side: str,
+                                            dilution: float = 1.0) -> dict:
     """
     Same as orthotropic_engineering_constants(), but for ONE physical copper
     layer alone (side="bottom" uses phi_bot, side="top" uses phi_top) instead
     of smearing the whole 3-layer laminate into a single through-thickness
-    material. Uses the per-slab E_{bot,top}Cu_{xy,z}_GPa / alpha_{bot,top}Cu_*
-    fields voigt_reuss_bounds() also writes into every leaf record.
+    material. dilution=1.0 (default) uses the per-slab E_{bot,top}Cu_{xy,z}_GPa
+    / alpha_{bot,top}Cu_* fields voigt_reuss_bounds() already wrote into every
+    leaf record, at that leaf's true phi_bot/phi_top.
+
+    dilution < 1.0 recomputes those same single-slab Voigt/Reuss formulas
+    from scratch at phi * dilution instead of reading the precomputed
+    (dilution=1.0) fields -- for representing the true copper thickness
+    smeared over a thicker effective z-region (e.g.
+    simulate_pyansys_assembly.py --cu-penetration-elements): the real copper
+    volume does not grow just because the mesh element covering it does, so
+    the volume fraction homogenized over that thicker region must shrink by
+    the same factor the region grew by (true_thickness / effective_thickness)
+    to conserve it. Passing the undiluted (dilution=1.0) material across a
+    penetrated region instead would silently add copper volume that doesn't
+    physically exist.
 
     Pairs with the FR4 core being left as plain isotropic FR4 (it never
     carries copper, so it needs no per-leaf homogenization at all) -- see
@@ -189,9 +203,24 @@ def orthotropic_engineering_constants_layer(leaf: dict, materials: dict, side: s
     phi = leaf["phi_bot"] if side == "bottom" else leaf["phi_top"]
     nu_eff = phi * nu_cu + (1.0 - phi) * nu_fr4
 
-    tag = "botCu" if side == "bottom" else "topCu"
-    EX = EY = leaf[f"E_{tag}_xy_GPa"] * 1e3
-    EZ = leaf[f"E_{tag}_z_GPa"] * 1e3
+    if dilution == 1.0:
+        tag = "botCu" if side == "bottom" else "topCu"
+        EX = EY = leaf[f"E_{tag}_xy_GPa"] * 1e3
+        EZ = leaf[f"E_{tag}_z_GPa"] * 1e3
+        alpha_xy = leaf[f"alpha_{tag}_xy_per_K"]
+        alpha_z = leaf[f"alpha_{tag}_z_per_K"]
+    else:
+        phi_eff = phi * dilution
+        nu_eff = phi_eff * nu_cu + (1.0 - phi_eff) * nu_fr4
+        E_cu = materials["copper"]["E_GPa"] * 1e3     # GPa -> MPa, matches leaf fields' units
+        E_fr4 = materials["FR4"]["E_GPa"] * 1e3
+        alpha_cu = materials["copper"].get("CTE_per_K", 17e-6)
+        alpha_fr4_ip = materials["FR4"].get("CTE_inplane_per_K", materials["FR4"].get("CTE_per_K", 14e-6))
+        alpha_fr4_op = materials["FR4"].get("CTE_outofplane_per_K", materials["FR4"].get("CTE_per_K", 60e-6))
+        EX = EY = phi_eff * E_cu + (1.0 - phi_eff) * E_fr4
+        EZ = 1.0 / (phi_eff / E_cu + (1.0 - phi_eff) / E_fr4)
+        alpha_xy = (phi_eff * E_cu * alpha_cu + (1.0 - phi_eff) * E_fr4 * alpha_fr4_ip) / EX
+        alpha_z = phi_eff * alpha_cu + (1.0 - phi_eff) * alpha_fr4_op
     GXY = EX / (2.0 * (1.0 + nu_eff))
     GYZ = GXZ = EZ / (2.0 * (1.0 + nu_eff))
 
@@ -199,6 +228,6 @@ def orthotropic_engineering_constants_layer(leaf: dict, materials: dict, side: s
         "EX": EX, "EY": EY, "EZ": EZ,
         "PRXY": nu_eff, "PRYZ": nu_eff, "PRXZ": nu_eff,
         "GXY": GXY, "GYZ": GYZ, "GXZ": GXZ,
-        "ALPX": leaf[f"alpha_{tag}_xy_per_K"], "ALPY": leaf[f"alpha_{tag}_xy_per_K"],
-        "ALPZ": leaf[f"alpha_{tag}_z_per_K"],
+        "ALPX": alpha_xy, "ALPY": alpha_xy,
+        "ALPZ": alpha_z,
     }
