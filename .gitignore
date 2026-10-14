@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 .DS_Store
 mapdl_run/
+mapdl_run_thermal_nlayer/
 ~$*
 .claude/settings.local.json
 .continue/

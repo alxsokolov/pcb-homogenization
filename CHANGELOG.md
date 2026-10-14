@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+### n-layer PCB support
+
+A separate track of scripts for boards with more than two copper layers. The 2-layer scripts are untouched; nothing in the n-layer track imports them except to be verified against them.
+
+- `import_odb_board_nlayer.py` / `odb_stackup.py`: ODB++ import keeping **all** conductive layers (SIGNAL, POWER_GROUND and MIXED — inner planes are usually the most copper-rich layers on a multilayer board), with the physical stackup resolved from `matrix/matrix` + per-layer `attrlist`, cross-checked against `misc/attrlist` `.board_thickness`. `--stackup <yaml>` supplies thicknesses for jobs that carry none.
+- `import_gerber_board_nlayer.py`: n copper Gerbers plus a stackup YAML (Gerber carries no stackup at all, so it is an input, not something to recover).
+- `homogenization_nlayer.py`: Voigt-Reuss homogenization of an arbitrary n-slab laminate. `python homogenization_nlayer.py` self-tests that it reduces exactly to `homogenization.py` on a 3-slab stackup over 400 random cases, plus slab-count invariance.
+- `stackup_nlayer.py`: sample → ordered z slabs + per-layer rasters. Also reads the legacy 2-layer schema, so the n-layer tools can run on existing 2-layer samples as a cross-check.
+- `coarsegrain_nlayer.py`: separates the two choices the 2-layer path mixes — the in-plane discretization (`--mode grid` at element resolution or coarser, or `--mode quadtree`) and the material model per region (`--region-model homogenized_zlayers | homogenized | projection`). Writes a self-contained, inspectable `mesh/coarsegrain_nlayer.json` with region geometry, per-layer copper fractions and a deduplicated material table, before MAPDL is involved.
+- `simulate_pyansys_nlayer.py`: board-only MAPDL model. The mesh bands z by **physical layer**, so every slab gets its own element rows, no element straddles two layers, and each layer's copper volume is exact — which is why the n-layer path needs no copper-"dilution" correction. Reports effective in-plane CTE, warpage and peak von Mises, and checks the solved CTE against the analytical laminate value.
+- `plot_coarsegrain_nlayer.py`, `compare_nlayer_models.py`: inspection plots and a model comparison against the full-resolution `raster` reference.
+- `discretize.py` is shared and unchanged — it already rasterizes every copper layer listed in `metadata.json`.
+
+**The "structural" Voigt/Reuss bounds carry no information the global ones don't.** `homogenization.py` describes its structural bounds (`E_xy_voigt`, `E_z_reuss`) as tighter than the geometry-blind global pair, exploiting the known layer geometry. They are in fact algebraically identical to it, for any number of slabs, any thicknesses and any per-layer copper fractions — both slab quantities are linear in that slab's φ, so thickness-weighting commutes with evaluating at the mean φ. Verified to machine precision (bit-identical in plane, 1e-16 relative out of plane) on an 8-layer stackup with per-layer φ from 0.02 to 0.99. The consequence: a single smeared through-thickness material depends on the stackup *only* through φ_3D, so smearing discards the entire layer structure. That costs little on a 2-layer board (copper ~4% of thickness) and a lot on the 8-layer reference board (copper 37% of thickness, per-layer φ from 0.67 to 0.86), which is why `homogenized_zlayers` is the n-layer default. The per-slab (z-resolved) materials are the only place layer geometry genuinely enters the homogenization.
+
+**Known issue in the 2-layer ODB++ path (not fixed, to leave 2-layer results unchanged):** `odb_parser.parse_odb_attrlist()` splits on `=` without stripping whitespace, so a job writing `.layer_dielectric = 0.065` (Altium, Allegro) lands the key with a trailing space and every lookup misses it. Jobs writing `.layer_dielectric=1.51` with no spaces parse fine, which is why `odb_kitchen_sink` worked and `ublox`/`hella` silently fell back to defaults. `odb_stackup.py` carries its own whitespace-tolerant parser; fixing the shared one would change `hella`'s resolved copper thickness from 0.035 to 0.036614 mm.
+
 ## v0.1.2 (2026-10-05)
 
 - **Fixed: the component and solder never followed the thermal profile.** The CR0805 archive contains a `BFBLOCK` that fixes all of its nodes at 20 °C, and nodal temperatures override `BFUNIF`. In every earlier run, only the board cycled while the component and solder stayed at 20 °C. With TREF = 180 °C, they also started with a 160 K thermal mismatch: above 200 MPa in the solder during a constant 180 °C hold. `component_import.py` now deletes these nodal temperatures after `CDREAD`; the same hold now gives 0 MPa. **Results from runs before this fix are not valid.**

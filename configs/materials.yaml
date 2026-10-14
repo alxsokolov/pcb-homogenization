@@ -6,6 +6,7 @@ copper:
   nu: 0.34        # Poisson's ratio
   rho_kg_m3: 8960
   CTE_per_K: 17.0e-6
+  thermal_conductivity_W_mK: 385.0   # bulk copper (~385–400 W/m/K)
 
 FR4:
   # Elastic properties: isotropic approximation using in-plane values
@@ -15,6 +16,7 @@ FR4:
   # CTE: FR4 is strongly anisotropic in thermal expansion
   CTE_inplane_per_K: 14.0e-6      # x, y directions (~14–18 ppm/K)
   CTE_outofplane_per_K: 60.0e-6   # z direction (through-thickness, ~50–70 ppm/K)
+  thermal_conductivity_W_mK: 0.3  # resin, treated isotropic (~0.2–0.4 W/m/K)
 
 component_ceramic_chip:
   # Illustrative alumina/ceramic chip-resistor body CTE, NOT validated for

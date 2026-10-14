@@ -322,7 +322,7 @@ elements, already $\sim$\num{4.4}\texttimes\ the true copper thickness). A new
 mismatch matters: it artificially extends, $N$ extra FR4-core elements deep from each surface, the
 region treated as copper-bearing, with the mesh, in-plane raster/leaf grid and everything else
 unchanged. $N=0$ matches the physical stackup exactly and reuses \S\ref{sec:leaf-sweep}'s $N=50$
-points (\code{rv3032\_projection\_fine}, \code{rv3032\_homog\_leaf50}); $N \in \{1, 3, 5\}$ were run
+points (\code{rv3032\_proj\_50x50\_nz10}, \code{rv3032\_homogz\_50x50\_nz10\_g50}); $N \in \{1, 3, 5\}$ were run
 fresh for both board models, six solves at the \numproduct{50 x 50}/\code{nz\_per\_layer=10} mesh.
 
 The two board models cannot treat that extra depth the same way. Binary projection paints each

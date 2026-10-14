@@ -361,19 +361,37 @@ def discretize_sample(
     for layer in meta['layers']:
         if layer['type'] != 'copper':
             continue
-        gbr_path = sample_dir / layer['file']
-        if not gbr_path.exists():
-            print(f'  [warn] {gbr_path} not found, skipping', file=sys.stderr)
+        src_path = sample_dir / layer['file']
+        if not src_path.exists():
+            print(f'  [warn] {src_path} not found, skipping', file=sys.stderr)
             continue
-        print(f'  Parsing   {gbr_path.name} …')
-        geo   = parse_gerber(gbr_path)
-        if geo.dropped:
-            dropped_str = ', '.join(f'{n}x {name}' for name, n in geo.dropped.items())
-            print(f'  [warn] {gbr_path.name}: skipped unsupported aperture macros: {dropped_str}',
-                  file=sys.stderr)
-        polys = geometry_to_polygons(geo)
-        print(f'  Rasterizing {len(polys)} polygon(s) → {nx}×{ny} grid …')
-        layer_mask = rasterize(polys, W, H, nx, ny)
+
+        if layer.get('format') == 'odb':
+            # ODB++ copper layer: odb_parser.py + raster_geometry.py are the
+            # format-agnostic analogue of this file's own Gerber parser +
+            # rasterizer, kept separate so the Gerber path here stays
+            # self-contained (see module docstring / import_odb_board.py).
+            import odb_parser
+            import raster_geometry
+            print(f'  Parsing   {src_path} (ODB++) …')
+            origin = tuple(meta.get('odb', {}).get('origin_offset_mm', (0.0, 0.0)))
+            geo = odb_parser.parse_odb_features(src_path, origin=origin)
+            if geo.dropped:
+                dropped_str = ', '.join(f'{n}x {name}' for name, n in geo.dropped.items())
+                print(f'  [warn] {src_path.name}: skipped unsupported records: {dropped_str}',
+                      file=sys.stderr)
+            print(f'  Rasterizing (ODB++ regions/flashes/strokes/surfaces) → {nx}×{ny} grid …')
+            layer_mask = raster_geometry.rasterize_layer(geo, W, H, nx, ny)
+        else:
+            print(f'  Parsing   {src_path.name} …')
+            geo = parse_gerber(src_path)
+            if geo.dropped:
+                dropped_str = ', '.join(f'{n}x {name}' for name, n in geo.dropped.items())
+                print(f'  [warn] {src_path.name}: skipped unsupported aperture macros: {dropped_str}',
+                      file=sys.stderr)
+            polys = geometry_to_polygons(geo)
+            print(f'  Rasterizing {len(polys)} polygon(s) → {nx}×{ny} grid …')
+            layer_mask = rasterize(polys, W, H, nx, ny)
         combined |= layer_mask.astype(bool)
 
         # Save individual layer map so the FE models can assign each copper

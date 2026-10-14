@@ -68,21 +68,21 @@ def _default_label(sample_dir: Path) -> str:
     name = sample_dir.name
     if name == "rv3032_example":
         return "projection"
-    if name == "rv3032_reference":
+    if name == "rv3032_proj_20x20_nz10":
         return "projection (fine z-mesh reference)"
-    if name == "rv3032_homog":
+    if name == "rv3032_homog_20x20_nz2_boundary":
         return "homogenized (241 leaves)"
-    if name == "rv3032_homog_z":
+    if name == "rv3032_homogz_20x20_nz2_boundary":
         return "homogenized z-layers (241 leaves)"
-    if name == "rv3032_homog_quadtree":
+    if name == "rv3032_homog_20x20_nz2_budget":
         return "homogenized (19 leaves)"
-    if name == "rv3032_homog_quadtree_z":
+    if name == "rv3032_homogz_20x20_nz2_budget":
         return "homogenized z-layers (19 leaves)"
-    if name == "rv3032_homog_perelement":
+    if name == "rv3032_homogz_20x20_nz10":
         return "homogenized z-layers (1 leaf/element, 20x20 mesh)"
-    if name == "rv3032_projection_fine":
+    if name == "rv3032_proj_50x50_nz10":
         return "projection (50x50 mesh)"
-    if name == "rv3032_homog_perelement_finemesh":
+    if name == "rv3032_homogz_50x50_nz10_g20":
         return "homogenized z-layers (20x20 leaves, 50x50 mesh)"
     return name
 

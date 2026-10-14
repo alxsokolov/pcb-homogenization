@@ -25,6 +25,62 @@ The library modules are `homogenization.py`, `component_import.py` and `thermal_
 
 `docs/workflow_overview.pptx` gives an overview of the workflow.
 
+## n-layer pipeline
+
+A separate set of scripts handles boards with more than two copper layers. The 2-layer scripts above are untouched and keep working exactly as before; nothing in the n-layer track imports them except to be checked against them.
+
+```
+ODB++  ──► import_odb_board_nlayer.py    stackup + all copper layers
+Gerber ──► import_gerber_board_nlayer.py (+ stackup YAML)
+       ──► discretize.py                 copper rasters, one per layer (shared, unchanged)
+       ──► coarsegrain_nlayer.py         regions × materials → <sample>/mesh/coarsegrain_nlayer.json
+       ──► simulate_pyansys_nlayer.py    MAPDL board solve  → <sample>/results/pyansys_nlayer_<tag>.json
+```
+
+The pipeline separates two choices that the 2-layer path mixes together:
+
+- **How the board plane is discretized** (`coarsegrain_nlayer.py --mode`): `grid` with the FE mesh's own `--nx/--ny` (one region per element), `grid` with fewer (regions uniformly coarser than elements), or `quadtree` (adaptive, refined where the layout is heterogeneous).
+- **How each region's copper becomes material** (`--region-model`): `homogenized_zlayers` (each copper layer its own Voigt-Reuss material from its own area fraction), `homogenized` (one smeared material through the full thickness), or `projection` (black/white per region and layer).
+
+`simulate_pyansys_nlayer.py --board-model raster` skips the coarse-graining entirely and paints each element pure copper or dielectric from the layout, as the full-resolution reference to compare the others against.
+
+The FE mesh bands z by **physical layer**: every copper and dielectric slab gets its own element rows, so no element straddles two layers and each layer's copper volume is exact. This is why the n-layer path needs no copper-"dilution" correction.
+
+Supporting scripts:
+- `plot_coarsegrain_nlayer.py`: per-layer region maps of copper fraction, and the stackup through thickness — inspect the model before solving.
+- `compare_nlayer_models.py`: tabulates every solved board model against the `raster` reference.
+
+Library modules: `odb_stackup.py` (ODB++ → physical stackup), `stackup_nlayer.py` (sample → z slabs + rasters), `homogenization_nlayer.py` (n-slab Voigt-Reuss).
+
+`python homogenization_nlayer.py` runs a self-test that checks the n-layer formulas reduce exactly to `homogenization.py`'s on a 3-slab stackup. `stackup_nlayer.py` also reads the legacy 2-layer metadata schema, so the n-layer tools can be run on the existing 2-layer samples as a cross-check.
+
+### Where the ODB++ stackup comes from
+
+`odb_stackup.py` reads `matrix/matrix` for layer order and kind, each layer's `attrlist` for thicknesses, and `misc/attrlist` `.board_thickness` as a cross-check. Three decoding rules it implements, each verified against the JODY-W6 (Altium, 8 layers) and Hella (Allegro) jobs:
+
+- `.layer_dielectric` on a **conductive** layer is the thickness of the dielectric *below* it, not that layer's copper. Copper thickness comes from `.copper_weight`.
+- `.copper_weight` units vary by exporter: Altium writes µm (35.001), Allegro writes oz (1). Values above 10 are read as µm.
+- The resolved total is checked against `.board_thickness`. For JODY-W6: 8 copper (0.266008 mm) + 7 dielectric (0.462 mm) = 0.728008 mm against 0.72801226 — agreement to 4 nm.
+
+`matrix/stackup.xml` (ODB++ 8.1u3+, mainly for rigid-flex) is detected and reported but not parsed. Boards whose ODB++ carries no usable stackup — Hella has no `DIELECTRIC` rows at all — need `--stackup <yaml>` to supply the missing thicknesses.
+
+### n-layer quickstart (8-layer ublox board)
+
+```
+python import_odb_board_nlayer.py --odb-dir path/to/extracted/job --sample-id ublox_nlayer
+python discretize.py              data/samples/ublox_nlayer --resolution 20
+python coarsegrain_nlayer.py      data/samples/ublox_nlayer --mode grid --nx 40 --ny 40
+python plot_coarsegrain_nlayer.py data/samples/ublox_nlayer
+python simulate_pyansys_nlayer.py data/samples/ublox_nlayer --nx 40 --ny 40 `
+    --mapdl-dir C:\temp\mapdl_nlayer
+
+python simulate_pyansys_nlayer.py data/samples/ublox_nlayer --nx 40 --ny 40 `
+    --board-model raster --tag raster --mapdl-dir C:\temp\mapdl_nlayer
+python compare_nlayer_models.py   data/samples/ublox_nlayer
+```
+
+`--dry-run` reports the mesh, material count and analytical laminate reference without launching MAPDL.
+
 ## Install
 
 ```
@@ -84,7 +140,8 @@ Then set the tracked component pads (`PAD_1_XY_MM` / `PAD_2_XY_MM`) at the top o
 
 ## Known limitations
 
-- Only 2-layer boards are supported (outer copper pair + dielectric core).
+- The 2-layer pipeline above supports only 2-layer boards (outer copper pair + dielectric core). Multilayer boards go through the separate n-layer track described above, which is board-only — no component, no solder, no creep yet.
+- Via copper is not represented anywhere: both tracks model copper only in the layer planes. On a thin HDI board this matters — the JODY-W6 reference job is 0.728 mm over 8 layers with blind and stacked micro vias between every adjacent layer pair, and that via copper carries real through-thickness stiffness.
 - One component (CR0805) is placed manually per run.
 - TREF is 180 °C, not the 205 °C reflow peak, because the SAC305 material data only extends to 180 °C (see `configs/thermal_profile.yaml`).
 - Gerber arcs (G02/G03) are approximated as straight strokes.
