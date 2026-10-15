@@ -1,0 +1,23 @@
+synth4: 20.000 x 15.000 mm, 1606.0 um, 4 copper layers (nlayer schema)
+  [ 6] copper     F_Cu         z  1.5710- 1.6060    35.0 um  phi=0.1838
+  [ 5] dielectric dielectric_1 z  1.3710- 1.5710   200.0 um  
+  [ 4] copper     In1_Cu       z  1.3530- 1.3710    18.0 um  phi=0.8661
+  [ 3] dielectric dielectric_2 z  0.2530- 1.3530  1100.0 um  
+  [ 2] copper     In2_Cu       z  0.2350- 0.2530    18.0 um  phi=0.1838
+  [ 1] dielectric dielectric_3 z  0.0350- 0.2350   200.0 um  
+  [ 0] copper     B_Cu         z  0.0000- 0.0350    35.0 um  phi=0.8661
+
+Mesh: 10 x 10 x 7 = 700 elements, 968 nodes
+  in-plane element 2.0000 x 1.5000 mm
+  thinnest slab 'In2_Cu': 18.0 um -> 1 row(s) of 18.0 um (in-plane/through-thickness aspect ratio 111:1)
+
+Board model: coarsegrain / homogenized_zlayers  (100 regions, 87 materials, grid discretization)
+  regions coincide with elements (one region per element)
+
+Analytical laminate reference (whole board, true per-layer phi):
+  phi_3D     = 0.034647
+  alpha_xy   = 14.5316 ppm/K
+  alpha_z    = 58.5102 ppm/K
+  E_xy/E_z   = 23465 / 20595 MPa
+
+--dry-run: stopping before MAPDL.

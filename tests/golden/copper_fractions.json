@@ -1,0 +1,18 @@
+{
+  "_comment": "Captured from the pre-restructure code (discretize.py @ --resolution 10) before Phase 1. rv3032_example is Gerber-sourced; odb_kitchen_sink and hella are ODB++-sourced. hella's value here predates the D11 attrlist-whitespace fix, so the post-fix copper layer thickness differs (0.035 -> 0.036614 mm) even though the raster copper_fraction itself is a 2D quantity unaffected by that fix.",
+  "rv3032_example": {
+    "resolution_px_per_mm": 10.0,
+    "grid": {"nx": 200, "ny": 150},
+    "copper_fraction": 0.8810
+  },
+  "odb_kitchen_sink": {
+    "resolution_px_per_mm": 10.0,
+    "grid": {"nx": 2231, "ny": 1413},
+    "copper_fraction": 0.1529
+  },
+  "hella": {
+    "resolution_px_per_mm": 10.0,
+    "grid": {"nx": 477, "ny": 190},
+    "copper_fraction": 0.6376
+  }
+}

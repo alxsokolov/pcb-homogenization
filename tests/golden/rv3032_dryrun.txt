@@ -1,0 +1,19 @@
+rv3032_real: 20.000 x 15.000 mm, 1600.0 um, 2 copper layers (legacy2 schema)
+  [ 2] copper     F_Cu z  1.5650- 1.6000    35.0 um  phi=0.1838
+  [ 1] dielectric core z  0.0350- 1.5650  1530.0 um  
+  [ 0] copper     B_Cu z  0.0000- 0.0350    35.0 um  phi=0.8661
+
+Mesh: 20 x 20 x 3 = 1200 elements, 1764 nodes
+  in-plane element 1.0000 x 0.7500 mm
+  thinnest slab 'B_Cu': 35.0 um -> 1 row(s) of 35.0 um (in-plane/through-thickness aspect ratio 29:1)
+
+Board model: coarsegrain / homogenized_zlayers  (400 regions, 84 materials, grid discretization)
+  regions coincide with elements (one region per element)
+
+Analytical laminate reference (whole board, true per-layer phi):
+  phi_3D     = 0.022966
+  alpha_xy   = 14.3708 ppm/K
+  alpha_z    = 59.0125 ppm/K
+  E_xy/E_z   = 22297 / 20390 MPa
+
+--dry-run: stopping before MAPDL.

@@ -1,0 +1,6 @@
+n-layer vs 2-layer reduction on 400 random 3-slab stackups: PASS (worst difference 0.08x tolerance, at t45 smeared MP GYZ)
+slab-count invariance at uniform phi: PASS
+structural bounds == global bounds on the 8-layer reference stackup (phi_3D=0.18614, per-layer phi 0.02-0.99): PASS
+  E_xy = 38614.011 MPa, E_z = 23671.910 MPa, alpha_xy = 15.7354 ppm/K
+  -> a smeared through-thickness material sees the stackup only through phi_3D;
+     only the per-slab (z-resolved) materials depend on how the copper is distributed.
