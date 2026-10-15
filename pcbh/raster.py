@@ -2,7 +2,7 @@
 """
 Shared 2D geometry model + rasterizer for PCB layer inputs.
 
-Both Gerber (discretize.py) and ODB++ (odb_parser.py) layer parsers build a
+Both Gerber (pcbh.gerber) and ODB++ (pcbh.odb) layer parsers build a
 LayerGeometry from their own file format, then hand it to rasterize_layer()
 here to produce the same (ny, nx) boolean copper/no-copper grid. Keeping the
 model + rasterizer format-agnostic is what lets discretize.py treat a Gerber

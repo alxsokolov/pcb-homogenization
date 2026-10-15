@@ -95,8 +95,8 @@ def apply_thermal_profile(mapdl, profile: ThermalProfile) -> None:
     results: 22C already at t=1s of a 205->22C/1800s cool-down).
 
     One load step per segment is still solved (TIME = segment end), so
-    load-step boundaries stay at profile points -- plot_cycle_creep_increment.py
-    relies on that (cycle boundaries are looked up by profile time).
+    load-step boundaries stay at profile points -- postprocess_creep.py's
+    cycle-boundary lookup relies on that.
 
     TREF is set to profile.reference_temp_c (the profile's first point,
     unless the YAML overrode it -- see this module's docstring). If the two
@@ -113,25 +113,3 @@ def apply_thermal_profile(mapdl, profile: ThermalProfile) -> None:
     for t in profile.time_s[1:]:
         mapdl.time(float(t))
         mapdl.solve()
-
-
-def main() -> None:
-    import argparse
-    parser = argparse.ArgumentParser(
-        description="Plot a thermal profile YAML as it will be applied (no simulation needed).")
-    parser.add_argument("profile", type=Path, help="e.g. configs/thermal_profile_example.yaml")
-    parser.add_argument("--out-png", type=Path, default=None,
-                        help="Output PNG; defaults to <profile>.png next to the YAML")
-    args = parser.parse_args()
-
-    profile = load_thermal_profile(args.profile)
-    out = args.out_png if args.out_png is not None else args.profile.with_suffix(".png")
-    plot_thermal_profile(profile, out, title=args.profile.stem)
-    bounds = cold_dwell_start_times(profile)
-    print(f"{profile.time_s.size - 1} load steps over {profile.time_s[-1]:.0f} s, "
-          f"TREF {profile.reference_temp_c:g} C, {max(len(bounds) - 1, 0)} full cycle(s)")
-    print(f"Wrote {out}")
-
-
-if __name__ == "__main__":
-    main()

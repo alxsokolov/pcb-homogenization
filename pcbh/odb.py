@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
 ODB++ job parser: matrix (layer stackup), layer feature files, and attrlist
-stackup attributes -- the ODB++ analogue of discretize.py's RS-274X Gerber
-parser. Produces the same LayerGeometry (raster_geometry.py) that Gerber
-layers produce, so discretize.py rasterizes both formats identically.
+stackup attributes -- the ODB++ analogue of pcbh.gerber's RS-274X parser.
+Produces the same pcbh.raster.LayerGeometry that Gerber layers produce, so
+discretize.py rasterizes both formats identically.
 
 Covers the subset of the ODB++ Design Format actually needed here: the
 `matrix/matrix` structured-text layer table, and per-layer `features` /
 `attrlist` files under `steps/<step>/layers/<layer>/`. Feature records
 supported: pad (P), line (L), arc (A, flattened to a straight stroke -- the
-same curvature approximation discretize.py already makes for Gerber G02/G03),
+same curvature approximation pcbh.gerber already makes for Gerber G02/G03),
 and surface (S ... SE, with OB/OS/OC outer-boundary and CB/CS/CC hole
 segments; OC/CC arc segments are likewise flattened to straight edges).
 
@@ -18,12 +18,6 @@ the field layouts documented by the open-source ODBPy parser
 (github.com/ulikoehler/ODBPy, Apache-2.0), used here to confirm record
 column order -- this module is an independent implementation against the
 spec, not a port of ODBPy.
-
-Usage (library only; see import_odb_board.py for the sample-building CLI):
-    import odb_parser
-    layers = odb_parser.parse_odb_matrix(job_dir / "matrix" / "matrix")
-    geo    = odb_parser.parse_odb_features(job_dir / "steps/pcb/layers/f.cu/features")
-    attrs  = odb_parser.parse_odb_attrlist(job_dir / "steps/pcb/layers/f.cu/attrlist")
 """
 
 from __future__ import annotations
@@ -34,7 +28,7 @@ from pathlib import Path
 
 import numpy as np
 
-from raster_geometry import Aperture, LayerGeometry, Surface
+from pcbh.raster import Aperture, LayerGeometry, Surface
 
 # ---------------------------------------------------------------------------
 # matrix/matrix — structured-text layer table
@@ -83,22 +77,58 @@ def parse_odb_matrix(path: Path) -> list[OdbLayer]:
 # attrlist — flat `.key=value` stackup / material attributes
 # ---------------------------------------------------------------------------
 
+# Whitespace- and CRLF-tolerant, and aware of a leading UNITS=MM|INCH
+# declaration that scales length-valued attributes to mm. A pre-restructure
+# version of this parser split on '=' without stripping whitespace, so
+# ".layer_dielectric = 0.065" (spaces around the '=', as several exporters
+# write it) landed under the key "layer_dielectric " -- with a trailing
+# space -- and every .get() for it missed; only jobs writing
+# ".layer_dielectric=1.51" with no spaces parsed correctly. Fixed here: both
+# forms parse the same way, and it changes the resolved stackup for any job
+# that hit the bug (see CHANGELOG).
+_ATTR_RE = re.compile(r'^\.([A-Za-z_][\w]*)\s*=\s*(.*)$')
+_UNITS_RE = re.compile(r'^UNITS\s*=\s*(MM|INCH)\s*$', re.I)
+
+_MM_PER_INCH = 25.4
+
+# Attributes whose value is a length in the file's own UNITS.
+_LENGTH_ATTRS = frozenset({"layer_dielectric", "board_thickness"})
+
 
 def parse_odb_attrlist(path: Path) -> dict[str, float | str]:
-    """Parse a `.key=value` attrlist file. Numeric values are returned as float."""
+    """
+    Parse an ODB++ `.key = value` attrlist, tolerating whitespace around the
+    '=' and CRLF line endings. Numeric values come back as float.
+
+    A leading `UNITS=MM|INCH` line applies to every length-valued attribute
+    in the file; values are converted to mm so callers never deal with
+    inches. Only the attributes that are lengths are converted
+    (_LENGTH_ATTRS) -- .copper_weight is a weight (oz) or an explicit
+    micrometre figure, never a file-unit length, and .dielectric_constant
+    and .loss_tangent are dimensionless.
+    """
     if not path.exists():
         return {}
     out: dict[str, float | str] = {}
-    for line in path.read_text().splitlines():
-        line = line.strip()
-        if not line or '=' not in line or not line.startswith('.'):
+    scale = 1.0
+    for raw in path.read_text(errors="replace").replace("\r", "").splitlines():
+        line = raw.strip()
+        if not line:
             continue
-        k, _, v = line.partition('=')
-        k = k[1:]
+        m_units = _UNITS_RE.match(line)
+        if m_units:
+            scale = _MM_PER_INCH if m_units.group(1).upper() == "INCH" else 1.0
+            continue
+        m = _ATTR_RE.match(line)
+        if not m:
+            continue
+        key, val = m.group(1), m.group(2).strip()
         try:
-            out[k] = float(v)
+            num = float(val)
         except ValueError:
-            out[k] = v
+            out[key] = val
+            continue
+        out[key] = num * scale if key in _LENGTH_ATTRS else num
     return out
 
 
@@ -143,7 +173,7 @@ def parse_odb_symbol(name: str) -> Aperture | None:
 # features — layer geometry (pads, lines, arcs, surfaces)
 # ---------------------------------------------------------------------------
 
-_UNITS_RE = re.compile(r'^(?:UNITS\s*=\s*|U\s+)(INCH|MM)\b', re.I)
+_UNITS_FEATURES_RE = re.compile(r'^(?:UNITS\s*=\s*|U\s+)(INCH|MM)\b', re.I)
 _DEF_RE  = re.compile(r'^([$@&])(\d+)\s+(.*)$')
 _PAD_RE  = re.compile(
     r'^P\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-1\s+\d+\s+[\d.]+|\d+)\s+([PN])\s+(\d+)\s+'
@@ -175,8 +205,8 @@ def parse_odb_features(path: Path, origin: tuple[float, float] = (0.0, 0.0)) -> 
     """
     Parse an ODB++ `features` (or `profile`) file and return a LayerGeometry
     with coordinates in mm, shifted by -origin (so the sample's board
-    bounding box can be normalized to start at (0,0), matching discretize.py's
-    convention for Gerber-sourced samples).
+    bounding box can be normalized to start at (0,0), matching
+    import_board.py's convention for Gerber-sourced samples).
 
     Coordinates are scaled to mm according to the file's own `UNITS=INCH|MM`
     (features files) or `U INCH|MM` (profile files) declaration; MM is
@@ -206,7 +236,7 @@ def parse_odb_features(path: Path, origin: tuple[float, float] = (0.0, 0.0)) -> 
         if not line or line.startswith('#') or line.startswith('F '):
             continue
 
-        m = _UNITS_RE.match(line)
+        m = _UNITS_FEATURES_RE.match(line)
         if m:
             scale = 25.4 if m.group(1).upper() == 'INCH' else 1.0
             continue

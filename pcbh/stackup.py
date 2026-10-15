@@ -1,48 +1,32 @@
 #!/usr/bin/env python3
 """
-Sample -> physical stackup + per-layer copper rasters (n-layer).
+Sample -> physical stackup + per-layer copper rasters.
 
-The single place the n-layer tools read a sample's geometry from. Turns
+The single place the pipeline reads a sample's geometry from. Turns
 <sample_dir>/metadata.json into an ordered list of z slabs (bottom face at
 z = 0, ascending) and attaches each copper slab's raster from
-<sample_dir>/mesh/ (written by discretize.py, which needs no n-layer variant
--- it already rasterizes every copper layer in metadata.json).
+<sample_dir>/mesh/ (written by discretize.py).
 
 This is the "geometrical space map of materials according to layout and
 stackup" step: layout (the rasters) x stackup (the z slabs) fully determines
 which material sits at any (x, y, z) in the board, before any mesh or
-coarse-graining enters the picture. is_copper_at() evaluates exactly that
+homogenization enters the picture. is_copper_at() evaluates exactly that
 map, and every later step is a discretization of it.
 
-Two metadata schemas are accepted:
-
-  n-layer   stackup.layers[] -- the ordered slab list written by
-            import_odb_board_nlayer.py / import_gerber_board_nlayer.py.
-
-  2-layer   the legacy flat stackup.copper_thickness_mm /
-            dielectric_thickness_mm, with layers[] carrying position
-            "top"/"bottom" (import_real_board.py, import_odb_board.py).
-            Reconstructed into the same three-slab list
-            [bottom Cu, dielectric, top Cu].
-
-Accepting the legacy schema is deliberate: it means the n-layer pipeline can
-be run on the existing 2-layer samples and checked against their known-good
-results, rather than only ever being exercised on boards that have no
-reference answer. The n-layer homogenization reduces exactly to the 2-layer
-formulas for a 3-slab stackup (see homogenization_nlayer.py), so agreement
-there is a real test of the generalization.
-
-The 2-layer scripts do not import this module and are unaffected by it.
+A 2-copper-layer board is not a special case: it is just a 3-slab stackup
+(bottom Cu / dielectric / top Cu). metadata.json schema_version 2 is the
+only schema this module reads -- see import_board.py.
 """
 
 from __future__ import annotations
 
 import json
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
+
+SCHEMA_VERSION = 2
 
 
 @dataclass
@@ -57,7 +41,7 @@ class Slab:
     layer_name: str | None = None   # copper only: raster key, e.g. "In1_Cu"
     material: str | None = None
     dielectric_type: str | None = None
-    raster: np.ndarray | None = None    # copper only, (ny, nx), attached by load_rasters()
+    raster: np.ndarray | None = None    # copper only, (ny, nx), attached by attach_rasters()
 
     @property
     def is_copper(self) -> bool:
@@ -74,7 +58,6 @@ class BoardStackup:
     width_mm: float
     height_mm: float
     slabs: list[Slab] = field(default_factory=list)      # ascending z
-    schema: str = "nlayer"                                # "nlayer" | "legacy2"
     dielectric_material: str = "FR4"
 
     @property
@@ -122,8 +105,7 @@ class BoardStackup:
 
     def describe(self) -> str:
         lines = [f"{self.sample_id}: {self.width_mm:.3f} x {self.height_mm:.3f} mm, "
-                 f"{self.total_thickness_mm * 1e3:.1f} um, {self.n_copper} copper layers "
-                 f"({self.schema} schema)"]
+                 f"{self.total_thickness_mm * 1e3:.1f} um, {self.n_copper} copper layers"]
         w = max([len(s.name) for s in self.slabs] + [4])
         for s in reversed(self.slabs):
             phi = (f"phi={float(s.raster.mean()):.4f}"
@@ -143,10 +125,10 @@ def raster_lookup(raster: np.ndarray, x_mm: float, y_mm: float,
     """
     True if (x, y) in mm falls on a copper pixel.
 
-    Raster convention, matching discretize.py's saved .npy arrays and
-    simulate_pyansys_benchmark._raster_lookup(): row index scales with y
-    (row 0 -> y near 0), column index with x, threshold 0.5. Only the
-    exported PNG previews flip Y for display; the arrays themselves do not.
+    Raster convention, matching discretize.py's saved .npy arrays: row index
+    scales with y (row 0 -> y near 0), column index with x, threshold 0.5.
+    Only the exported PNG previews flip Y for display; the arrays themselves
+    do not.
     """
     ny, nx = raster.shape
     ix = min(max(int(x_mm / width_mm * nx), 0), nx - 1)
@@ -158,9 +140,7 @@ def raster_area_mean(raster: np.ndarray, width_mm: float, height_mm: float,
                      x0: float, y0: float, x1: float, y1: float) -> float:
     """
     Mean of the raster pixels whose footprint overlaps the mm-space box
-    [x0,x1) x [y0,y1) -- i.e. that box's copper area fraction. Same
-    convention and same pixel-slice rounding as quadtree._area_mean(), so an
-    n-layer region's phi is computed exactly as the 2-layer one is.
+    [x0,x1) x [y0,y1) -- i.e. that box's copper area fraction.
     """
     ny, nx = raster.shape
     ix0 = max(0, int(np.floor(x0 / width_mm * nx)))
@@ -170,11 +150,42 @@ def raster_area_mean(raster: np.ndarray, width_mm: float, height_mm: float,
     return float(raster[iy0:iy1, ix0:ix1].mean())
 
 
+def layer_phi_grid(raster: np.ndarray, gx: int, gy: int) -> np.ndarray:
+    """
+    Copper area fraction of one copper layer's raster, averaged onto a
+    uniform gx (columns) x gy (rows) homogenization grid -- the grid
+    pcbh.grid.build() resolves materials over, independent of both the
+    raster's own pixel resolution and any later FE mesh resolution.
+
+    When the raster divides evenly (nx % gx == 0 and ny % gy == 0) this is
+    an exact reshape-and-mean: every pixel contributes to exactly one grid
+    cell, so the area-weighted grid mean reproduces the whole-layer mean to
+    machine precision (no pixel is ever double-counted). Otherwise falls
+    back to raster_area_mean() per cell (the same floor/ceil pixel-slice
+    rule discretize.py's callers have always used), which double-counts
+    boundary pixels between adjacent cells by a small amount -- a warning is
+    printed once by the caller (pcbh.grid.build()), not here, so a batch
+    build over many layers prints it once rather than once per layer.
+    """
+    ny, nx = raster.shape
+    if nx % gx == 0 and ny % gy == 0:
+        return raster.reshape(gy, ny // gy, gx, nx // gx).mean(axis=(1, 3)).astype(np.float64)
+    width_mm, height_mm = float(nx), float(ny)   # pixel units; cell size is just nx/gx, ny/gy
+    dx, dy = nx / gx, ny / gy
+    out = np.empty((gy, gx), dtype=np.float64)
+    for j in range(gy):
+        y0, y1 = j * dy, (j + 1) * dy
+        for i in range(gx):
+            x0, x1 = i * dx, (i + 1) * dx
+            out[j, i] = raster_area_mean(raster, width_mm, height_mm, x0, y0, x1, y1)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Loading
 # ---------------------------------------------------------------------------
 
-def _slabs_from_nlayer(stackup: dict) -> list[Slab]:
+def _slabs_from_metadata(stackup: dict) -> list[Slab]:
     slabs = []
     for rec in sorted(stackup["layers"], key=lambda r: r["index"]):
         slabs.append(Slab(
@@ -191,36 +202,7 @@ def _slabs_from_nlayer(stackup: dict) -> list[Slab]:
     return slabs
 
 
-def _slabs_from_legacy2(meta: dict) -> list[Slab]:
-    """
-    Rebuild the legacy 2-layer stackup as the same ordered slab list:
-    [bottom Cu, dielectric core, top Cu], z = 0 at the bottom face -- the
-    convention simulate_pyansys_benchmark.py already uses (z_cu_bot_mm =
-    copper thickness, z_cu_top_mm = that plus the core).
-    """
-    stk = meta["stackup"]
-    t_cu = float(stk["copper_thickness_mm"])
-    t_di = float(stk["dielectric_thickness_mm"])
-    by_pos = {l.get("position"): l for l in meta["layers"] if l.get("type") == "copper"}
-    bot = by_pos.get("bottom")
-    top = by_pos.get("top")
-    if bot is None or top is None:
-        raise ValueError("legacy 2-layer metadata needs copper layers with "
-                         "position 'top' and 'bottom'")
-    t_cu_bot = float(bot.get("thickness_mm", t_cu))
-    t_cu_top = float(top.get("thickness_mm", t_cu))
-    diel_mat = stk.get("dielectric_material", "FR4")
-    return [
-        Slab(0, "copper", bot.get("odb_layer_name", bot["name"]), t_cu_bot,
-             0.0, t_cu_bot, layer_name=bot["name"]),
-        Slab(1, "dielectric", "core", t_di,
-             t_cu_bot, t_cu_bot + t_di, material=diel_mat),
-        Slab(2, "copper", top.get("odb_layer_name", top["name"]), t_cu_top,
-             t_cu_bot + t_di, t_cu_bot + t_di + t_cu_top, layer_name=top["name"]),
-    ]
-
-
-def load_board_stackup(sample_dir: Path, load_rasters: bool = True) -> BoardStackup:
+def load_board(sample_dir: Path, load_rasters: bool = True) -> BoardStackup:
     """
     Read <sample_dir>/metadata.json into a BoardStackup, optionally attaching
     each copper slab's raster from <sample_dir>/mesh/.
@@ -229,19 +211,15 @@ def load_board_stackup(sample_dir: Path, load_rasters: bool = True) -> BoardStac
     if not meta_path.exists():
         raise FileNotFoundError(f"Not found: {meta_path}")
     meta = json.loads(meta_path.read_text())
-    stk = meta.get("stackup", {})
 
-    if "layers" in stk:
-        slabs, schema = _slabs_from_nlayer(stk), "nlayer"
-    elif "copper_thickness_mm" in stk and "dielectric_thickness_mm" in stk:
-        slabs, schema = _slabs_from_legacy2(meta), "legacy2"
-    else:
+    if meta.get("schema_version") != SCHEMA_VERSION or "layers" not in meta.get("stackup", {}):
         raise ValueError(
-            f"{meta_path}: stackup has neither an n-layer 'layers' list nor the legacy "
-            "'copper_thickness_mm'/'dielectric_thickness_mm' pair. If this is an n-layer "
-            "sample imported by the 2-layer import_odb_board.py, re-import it with "
-            "import_odb_board_nlayer.py."
+            f"{meta_path}: not a schema_version {SCHEMA_VERSION} sample (got "
+            f"{meta.get('schema_version')!r}). Re-import with import_board.py, or migrate an "
+            "older sample with tools/migrate_metadata.py."
         )
+    stk = meta["stackup"]
+    slabs = _slabs_from_metadata(stk)
 
     if not slabs:
         raise ValueError(f"{meta_path}: stackup contains no layers")
@@ -255,7 +233,6 @@ def load_board_stackup(sample_dir: Path, load_rasters: bool = True) -> BoardStac
         width_mm=float(meta["board"]["width_mm"]),
         height_mm=float(meta["board"]["height_mm"]),
         slabs=slabs,
-        schema=schema,
         dielectric_material=stk.get("dielectric_material", "FR4"),
     )
     if load_rasters:
@@ -274,7 +251,7 @@ def attach_rasters(sample_dir: Path, board: BoardStackup) -> None:
     if not disc_path.exists():
         raise FileNotFoundError(f"Run discretize.py first -- not found: {disc_path}")
     disc = json.loads(disc_path.read_text())
-    layer_maps = disc.get("layer_maps", {})
+    layer_maps = disc.get("layers", {})
 
     missing = []
     shapes = set()
@@ -298,24 +275,3 @@ def attach_rasters(sample_dir: Path, board: BoardStackup) -> None:
     if len(shapes) > 1:
         raise ValueError(f"Copper layer rasters have differing shapes {sorted(shapes)} -- "
                          "re-run discretize.py so every layer is on one grid")
-
-
-def main() -> None:
-    import argparse
-    p = argparse.ArgumentParser(
-        description="Print a sample's resolved n-layer stackup and per-layer copper fractions.")
-    p.add_argument("sample_dir", type=Path)
-    p.add_argument("--no-rasters", action="store_true",
-                   help="Stackup only; do not load mesh/ rasters (skips needing discretize.py)")
-    args = p.parse_args()
-    try:
-        board = load_board_stackup(args.sample_dir, load_rasters=not args.no_rasters)
-    except (FileNotFoundError, ValueError) as e:
-        sys.exit(str(e))
-    print(board.describe())
-    if not args.no_rasters:
-        print(f"\n3D copper volume fraction: {board.copper_fraction_3d():.6f}")
-
-
-if __name__ == "__main__":
-    main()

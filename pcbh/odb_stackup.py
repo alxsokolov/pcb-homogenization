@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
 """
-ODB++ physical stackup resolution (n-layer).
+ODB++ physical stackup resolution.
 
 Reads the layer stackup -- order, kind, and *thickness* of every conductive
-and dielectric layer -- out of an extracted ODB++ job. This is the piece the
-2-layer importer (import_odb_board.py) only needed a degenerate version of:
-there, "the stackup" was one copper thickness plus the sum of whatever sat
-between the two outer layers. For an n-layer board the individual thicknesses
-and their z order are the whole point, so they get resolved properly here.
+and dielectric layer -- out of an extracted ODB++ job.
 
 Where ODB++ keeps stackup information, in the order this module tries:
 
@@ -36,14 +32,14 @@ Where ODB++ keeps stackup information, in the order this module tries:
       jobs this was developed against has one, so it is detected and
       reported but not parsed -- see _warn_unparsed_stackup_xml().
 
-Three decoding rules, each established against the JODY-W6 (Altium, 8 layers)
-and Hella (Allegro-style) jobs:
+Three decoding rules, each established against an 8-layer Altium job and an
+Allegro-style job:
 
   1. .layer_dielectric on a CONDUCTIVE layer is the thickness of the
-     dielectric BELOW it, not that layer's copper thickness. In JODY-W6
-     every signal row equals the DIELECTRIC row beneath it (TOP_LAYER
-     0.065 = DIELECTRIC_1, MID-LAYER_1 0.065 = DIELECTRIC_2, ...), and
-     BOTTOM_LAYER, which has nothing below it, carries a leftover 0.02.
+     dielectric BELOW it, not that layer's copper thickness. In the 8-layer
+     reference job every signal row equals the DIELECTRIC row beneath it
+     (TOP_LAYER 0.065 = DIELECTRIC_1, MID-LAYER_1 0.065 = DIELECTRIC_2, ...),
+     and BOTTOM_LAYER, which has nothing below it, carries a leftover 0.02.
      Summing .layer_dielectric over every row double-counts each dielectric
      (0.944 mm against a real 0.728 mm board). Copper thickness therefore
      comes from .copper_weight; a conductive layer's own .layer_dielectric
@@ -56,30 +52,25 @@ and Hella (Allegro-style) jobs:
      and anything at or below it as oz (x 0.035 mm/oz). The two ranges do
      not overlap.
 
-  3. The resolved total must match misc/attrlist .board_thickness. For
-     JODY-W6: 8 copper layers (0.266008 mm, from .copper_weight as um) +
-     7 dielectrics (0.462 mm, from their own .layer_dielectric) = 0.728008
-     mm against .board_thickness = 0.72801226 -- agreement to 4 nm, which
-     is what confirms rules 1 and 2.
+  3. The resolved total must match misc/attrlist .board_thickness. For the
+     8-layer reference job: 8 copper layers (0.266008 mm, from
+     .copper_weight as um) + 7 dielectrics (0.462 mm, from their own
+     .layer_dielectric) = 0.728008 mm against .board_thickness = 0.72801226
+     -- agreement to 4 nm, which is what confirms rules 1 and 2.
 
-Not every job carries a stackup at all: the Hella board has no DIELECTRIC
-rows in its matrix, .copper_weight = 1 oz, and .layer_dielectric = 0.036614
-on its top layer -- a 37 um core, which is not a believable board. Boards
-like that need their dielectric thicknesses supplied from outside the job;
-resolve_stackup() takes an `overrides` mapping for exactly that and reports
-every layer whose thickness it had to guess.
-
-Used by import_odb_board_nlayer.py. The 2-layer import_odb_board.py does not
-use this module and is unaffected by it.
+Not every job carries a stackup at all: a board with no DIELECTRIC rows in
+its matrix and an unbelievable .layer_dielectric on its top layer needs its
+dielectric thicknesses supplied from outside the job; resolve_stackup() takes
+an `overrides` mapping for exactly that and reports every layer whose
+thickness it had to guess.
 """
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import odb_parser
+from pcbh.odb import parse_odb_attrlist, parse_odb_matrix
 
 # ODB++ layer TYPEs that carry copper we homogenize. POWER_GROUND and MIXED
 # are copper layers just as much as SIGNAL is -- a plane layer is still
@@ -103,66 +94,6 @@ DEFAULT_COPPER_THICKNESS_MM = 0.035
 # mismatch: 2 um, comfortably above the rounding in the source files and far
 # below any real stackup discrepancy.
 _BOARD_THICKNESS_TOL_MM = 2e-3
-
-
-# ---------------------------------------------------------------------------
-# attrlist parsing
-# ---------------------------------------------------------------------------
-
-# NOTE: deliberately NOT odb_parser.parse_odb_attrlist(). That one splits on
-# '=' without stripping whitespace, so Altium's ".layer_dielectric = 0.065"
-# (spaces around the '=') lands in the dict under the key
-# "layer_dielectric " -- with a trailing space -- and every .get() for it
-# misses. Jobs that write ".layer_dielectric=1.51" with no spaces (the
-# odb-kitchen-sink sample) parse fine, which is why the 2-layer path never
-# noticed. Fixing it there would change the 2-layer samples' resolved
-# thicknesses, so the whitespace-tolerant version lives here instead and the
-# 2-layer path is left exactly as it is.
-_ATTR_RE = re.compile(r'^\.([A-Za-z_][\w]*)\s*=\s*(.*)$')
-_UNITS_RE = re.compile(r'^UNITS\s*=\s*(MM|INCH)\s*$', re.I)
-
-_MM_PER_INCH = 25.4
-
-
-def parse_attrlist(path: Path) -> dict[str, float | str]:
-    """
-    Parse an ODB++ `.key = value` attrlist, tolerating whitespace around the
-    '=' and CRLF line endings. Numeric values come back as float.
-
-    A leading `UNITS=MM|INCH` line applies to every length-valued attribute
-    in the file; values are converted to mm so callers never deal with
-    inches. Only the attributes that are lengths are converted
-    (_LENGTH_ATTRS) -- .copper_weight is a weight (oz) or an explicit
-    micrometre figure, never a file-unit length, and .dielectric_constant
-    and .loss_tangent are dimensionless.
-    """
-    if not path.exists():
-        return {}
-    out: dict[str, float | str] = {}
-    scale = 1.0
-    for raw in path.read_text(errors="replace").replace("\r", "").splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        m_units = _UNITS_RE.match(line)
-        if m_units:
-            scale = _MM_PER_INCH if m_units.group(1).upper() == "INCH" else 1.0
-            continue
-        m = _ATTR_RE.match(line)
-        if not m:
-            continue
-        key, val = m.group(1), m.group(2).strip()
-        try:
-            num = float(val)
-        except ValueError:
-            out[key] = val
-            continue
-        out[key] = num * scale if key in _LENGTH_ATTRS else num
-    return out
-
-
-# Attributes whose value is a length in the file's own UNITS.
-_LENGTH_ATTRS = frozenset({"layer_dielectric", "board_thickness"})
 
 
 def _copper_thickness_mm(attrs: dict) -> tuple[float, str]:
@@ -249,10 +180,10 @@ def _warn_unparsed_stackup_xml(odb_dir: Path, warnings: list[str]) -> None:
     """
     matrix/stackup.xml (ODB++ 8.1u3+) is the dedicated stackup file and, where
     present, is more authoritative than matrix + attrlist -- especially for
-    rigid-flex, where a linear matrix cannot express the stackup. It is not
-    parsed here (no job on hand has one), so its presence is reported rather
-    than silently ignored: a board that ships one may well disagree with what
-    this module derives from the matrix.
+    rigid-flex, where a linear matrix cannot express the stackup at all. It is
+    not parsed here (no job on hand has one), so its presence is reported
+    rather than silently ignored: a board that ships one may well disagree
+    with what this module derives from the matrix.
     """
     p = odb_dir / "matrix" / "stackup.xml"
     if p.exists():
@@ -276,7 +207,7 @@ def resolve_stackup(
     step_dir  the step whose layers/ holds the per-layer attrlists
     overrides {layer_name_lowercased: thickness_mm} -- wins over anything
               found in the job, for boards whose ODB++ carries no usable
-              stackup (see the module docstring on the Hella board).
+              stackup.
 
     Only the conductive and dielectric layers between (and including) the
     outermost pair of conductive layers become part of the stackup; solder
@@ -287,7 +218,7 @@ def resolve_stackup(
     warnings: list[str] = []
     _warn_unparsed_stackup_xml(odb_dir, warnings)
 
-    matrix = odb_parser.parse_odb_matrix(odb_dir / "matrix" / "matrix")
+    matrix = parse_odb_matrix(odb_dir / "matrix" / "matrix")
     layers_dir = step_dir / "layers"
 
     structural = [l for l in matrix
@@ -306,7 +237,7 @@ def resolve_stackup(
     structural = [l for l in structural if first <= l.row <= last]
 
     # attrlists, keyed by matrix row, read once.
-    attrs_of = {l.row: parse_attrlist(layers_dir / l.name / "attrlist")
+    attrs_of = {l.row: parse_odb_attrlist(layers_dir / l.name / "attrlist")
                 for l in structural}
 
     # Rule 1: a conductive layer's .layer_dielectric describes the dielectric
@@ -369,7 +300,7 @@ def resolve_stackup(
     resolved.reverse()
     _assign_z(resolved)
 
-    misc_attrs = parse_attrlist(odb_dir / "misc" / "attrlist")
+    misc_attrs = parse_odb_attrlist(odb_dir / "misc" / "attrlist")
     board_t = misc_attrs.get("board_thickness")
     board_t = float(board_t) if isinstance(board_t, (int, float)) and board_t > 0 else None
 

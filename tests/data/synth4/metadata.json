@@ -1,0 +1,127 @@
+{
+  "schema_version": 2,
+  "sample_id": "synth4",
+  "board": {
+    "width_mm": 20.0,
+    "height_mm": 15.0
+  },
+  "layers": [
+    {
+      "name": "F_Cu",
+      "file": "gerber/F_Cu.gbr",
+      "format": "gerber",
+      "position": "top",
+      "stackup_index": 6
+    },
+    {
+      "name": "In1_Cu",
+      "file": "gerber/In1_Cu.gbr",
+      "format": "gerber",
+      "position": "inner_1",
+      "stackup_index": 4
+    },
+    {
+      "name": "In2_Cu",
+      "file": "gerber/In2_Cu.gbr",
+      "format": "gerber",
+      "position": "inner_2",
+      "stackup_index": 2
+    },
+    {
+      "name": "B_Cu",
+      "file": "gerber/B_Cu.gbr",
+      "format": "gerber",
+      "position": "bottom",
+      "stackup_index": 0
+    }
+  ],
+  "stackup": {
+    "dielectric_material": "FR4",
+    "total_thickness_mm": 1.606,
+    "layers": [
+      {
+        "index": 0,
+        "kind": "copper",
+        "name": "B_Cu",
+        "layer_name": "B_Cu",
+        "thickness_mm": 0.035,
+        "z0_mm": 0.0,
+        "z1_mm": 0.035
+      },
+      {
+        "index": 1,
+        "kind": "dielectric",
+        "name": "dielectric_3",
+        "thickness_mm": 0.2,
+        "z0_mm": 0.035,
+        "z1_mm": 0.235,
+        "material": "FR4"
+      },
+      {
+        "index": 2,
+        "kind": "copper",
+        "name": "In2_Cu",
+        "layer_name": "In2_Cu",
+        "thickness_mm": 0.018,
+        "z0_mm": 0.235,
+        "z1_mm": 0.253
+      },
+      {
+        "index": 3,
+        "kind": "dielectric",
+        "name": "dielectric_2",
+        "thickness_mm": 1.1,
+        "z0_mm": 0.253,
+        "z1_mm": 1.353,
+        "material": "FR4"
+      },
+      {
+        "index": 4,
+        "kind": "copper",
+        "name": "In1_Cu",
+        "layer_name": "In1_Cu",
+        "thickness_mm": 0.018,
+        "z0_mm": 1.353,
+        "z1_mm": 1.371
+      },
+      {
+        "index": 5,
+        "kind": "dielectric",
+        "name": "dielectric_1",
+        "thickness_mm": 0.2,
+        "z0_mm": 1.371,
+        "z1_mm": 1.571,
+        "material": "FR4"
+      },
+      {
+        "index": 6,
+        "kind": "copper",
+        "name": "F_Cu",
+        "layer_name": "F_Cu",
+        "thickness_mm": 0.035,
+        "z0_mm": 1.571,
+        "z1_mm": 1.606
+      }
+    ]
+  },
+  "source": {
+    "format": "gerber",
+    "bbox_mm": [
+      0.0,
+      0.0,
+      20.0,
+      15.0
+    ],
+    "files": [
+      "data\\samples\\rv3032_example\\gerber\\F_Cu.gbr",
+      "data\\samples\\rv3032_example\\gerber\\B_Cu.gbr",
+      "data\\samples\\rv3032_example\\gerber\\F_Cu.gbr",
+      "data\\samples\\rv3032_example\\gerber\\B_Cu.gbr"
+    ],
+    "stackup_file": "configs\\stackup_synth4.yaml"
+  },
+  "generation": {
+    "script": "import_board.py",
+    "timestamp": "2026-10-15T15:10:28+00:00"
+  }
+}
